@@ -345,4 +345,99 @@ void init_triton_amd(py::module &&m) {
   m.def("add_scalarize_packed_fops_llvm_pass", [](llvm::Function *fn) {
     mlir::triton::AMD::runScalarizePackedFOpsPass(*fn);
   });
+
+  auto hipBlas = m.def_submodule("hipblas");
+  py::class_<hipBlasLtInstance>(cublas, "CublasLt")
+    .def(py::init<>([&](py::object &workspace) {
+      auto wrk_ptr = workspace.attr("data_ptr")().cast<uint64_t>();
+      auto wrk_size = workspace.attr("numel")().cast<size_t>() *
+                      workspace.attr("element_size")().cast<size_t>();
+      return new CublasLtInstance(wrk_ptr, wrk_size);
+    }))
+    .def("matmul",
+        [](CublasLtInstance &self, py::object &A, py::object &B,
+            py::object &C) {
+          auto A_ptr = A.attr("data_ptr")().cast<uint64_t>();
+          auto B_ptr = B.attr("data_ptr")().cast<uint64_t>();
+          auto C_ptr = C.attr("data_ptr")().cast<uint64_t>();
+
+          auto A_shape = A.attr("shape").cast<std::vector<int>>();
+          auto B_shape = B.attr("shape").cast<std::vector<int>>();
+          auto C_shape = C.attr("shape").cast<std::vector<int>>();
+
+          auto A_dtype =
+              A.attr("dtype").attr("__str__")().cast<std::string>();
+          auto B_dtype =
+              B.attr("dtype").attr("__str__")().cast<std::string>();
+          auto C_dtype =
+              C.attr("dtype").attr("__str__")().cast<std::string>();
+
+          checkMatmulConstraints(A_dtype, B_dtype, C_dtype, A_shape, B_shape,
+                                  C_shape);
+
+          std::string dtype_str =
+              A_dtype.substr(A_dtype.find_last_of('.') + 1);
+          cudaDataType_t dtype;
+          if (dtype_str == "float8_e4m3fn") {
+            dtype = CUDA_R_8F_E4M3;
+          } else if (dtype_str == "float16") {
+            dtype = CUDA_R_16F;
+          } else if (dtype_str == "float32") {
+            // Use FP32 inputs with TF32 compute in cublasLt (set in compute
+            // type)
+            dtype = CUDA_R_32F;
+          } else if (dtype_str == "bfloat16") {
+            dtype = CUDA_R_16BF;
+          } else {
+            throw std::runtime_error(
+                "Unsupported dtype for cublasLt.matmul: " + dtype_str);
+          }
+
+          self.matmul(A_shape[0], B_shape[0], A_shape[1], A_ptr, B_ptr,
+                      C_ptr, dtype);
+        })
+    .def("gemm", [](CublasLtInstance &self, py::object &A, py::object &B,
+                    py::object &C, py::object &D, float alpha, float beta) {
+      auto A_ptr = A.attr("data_ptr")().cast<uint64_t>();
+      auto B_ptr = B.attr("data_ptr")().cast<uint64_t>();
+      auto C_ptr = C.attr("data_ptr")().cast<uint64_t>();
+      auto D_ptr = D.attr("data_ptr")().cast<uint64_t>();
+
+      auto A_shape = A.attr("shape").cast<std::vector<int>>();
+      auto B_shape = B.attr("shape").cast<std::vector<int>>();
+      auto C_shape = C.attr("shape").cast<std::vector<int>>();
+      auto D_shape = D.attr("shape").cast<std::vector<int>>();
+
+      auto A_dtype = A.attr("dtype").attr("__str__")().cast<std::string>();
+      auto B_dtype = B.attr("dtype").attr("__str__")().cast<std::string>();
+      auto C_dtype = C.attr("dtype").attr("__str__")().cast<std::string>();
+      auto D_dtype = D.attr("dtype").attr("__str__")().cast<std::string>();
+
+      checkMatmulConstraints(A_dtype, B_dtype, D_dtype, A_shape, B_shape,
+                            D_shape);
+      if (C_dtype != "torch.float16") {
+        throw std::runtime_error("C dtype must be float16, got " + C_dtype);
+      }
+      if (C_shape != D_shape) {
+        throw std::runtime_error("C and D shapes must match");
+      }
+
+      std::string dtype_str = A_dtype.substr(A_dtype.find_last_of('.') + 1);
+      cudaDataType_t dtype;
+      if (dtype_str == "float8_e4m3fn") {
+        dtype = CUDA_R_8F_E4M3;
+      } else if (dtype_str == "float16") {
+        dtype = CUDA_R_16F;
+      } else if (dtype_str == "float32") {
+        dtype = CUDA_R_32F;
+      } else if (dtype_str == "bfloat16") {
+        dtype = CUDA_R_16BF;
+      } else {
+        throw std::runtime_error("Unsupported dtype for cublasLt.gemm: " +
+                                dtype_str);
+      }
+
+      self.gemm(A_shape[0], B_shape[0], A_shape[1], A_ptr, B_ptr, C_ptr,
+                D_ptr, dtype, alpha, beta);
+    });
 }
