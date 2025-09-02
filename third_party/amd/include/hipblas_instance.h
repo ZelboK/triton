@@ -10,15 +10,15 @@ class HipBlasLtInstance {
   // Typedefs for hipblas functions
   typedef hipblasStatus_t (*hipblasLtCreate_t)(hipblasLtHandle_t *);
   typedef hipblasStatus_t (*hipblasLtDestroy_t)(hipblasLtHandle_t);
-  typedef hipblasStatus_t (*hipblasLtMatmulDescCreate_t)(hipblasLtMatmulDesc_t *,
-                                                       hipblasComputeType_t,
-                                                       hipblasDataType_t);
-  typedef hipblasStatus_t (*hipblasLtMatmulDescDestroy_t)(hipblasLtMatmulDesc_t);
+  typedef hipblasStatus_t (*hipblasLtMatmulDescCreate_t)(
+      hipblasLtMatmulDesc_t *, hipblasComputeType_t, hipData_t);
+  typedef hipblasStatus_t (*hipblasLtMatmulDescDestroy_t)(
+      hipblasLtMatmulDesc_t);
   typedef hipblasStatus_t (*hipblasLtMatmulDescSetAttribute_t)(
       hipblasLtMatmulDesc_t, hipblasLtMatmulDescAttributes_t, const void *,
       size_t);
   typedef hipblasStatus_t (*hipblasLtMatrixLayoutCreate_t)(
-      hipblasLtMatrixLayout_t *, hipblasDataType_t, uint64_t, uint64_t, int64_t);
+      hipblasLtMatrixLayout_t *, hipData_t, uint64_t, uint64_t, int64_t);
   typedef hipblasStatus_t (*hipblasLtMatrixLayoutDestroy_t)(
       hipblasLtMatrixLayout_t);
   typedef hipblasStatus_t (*hipblasLtMatmulPreferenceCreate_t)(
@@ -35,12 +35,13 @@ class HipBlasLtInstance {
       int *);
   typedef hipblasStatus_t (*hipblasLtMatmul_t)(
       hipblasLtHandle_t, hipblasLtMatmulDesc_t, const void *, const void *,
-      const hipblasLtMatrixLayout_t, const void *, const hipblasLtMatrixLayout_t,
-      const void *, const void *, const hipblasLtMatrixLayout_t, void *,
-      const hipblasLtMatrixLayout_t, const hipblasLtMatmulAlgo_t *, void *,
-      size_t, cudaStream_t);
+      const hipblasLtMatrixLayout_t, const void *,
+      const hipblasLtMatrixLayout_t, const void *, const void *,
+      const hipblasLtMatrixLayout_t, void *, const hipblasLtMatrixLayout_t,
+      const hipblasLtMatmulAlgo_t *, void *, size_t, hipStream_t);
 
-  static constexpr const char *name = "libhipblas.so"; // TODO: verify this is correct so name
+  static constexpr const char *name =
+      "libhipblas.so"; // TODO: verify this is correct so name
 
   hipblasLtCreate_t hipblasLtCreate;
   hipblasLtDestroy_t hipblasLtDestroy;
@@ -80,8 +81,9 @@ class HipBlasLtInstance {
     dlerror(); // Clear any existing error
 
     hipblasLtCreate = (hipblasLtCreate_t)dlsym(dylibHandle, "hipblasLtCreate");
-    hipblasLtDestroy = (hipblasLtDestroy_t)dlsym(dylibHandle, "hipblasLtDestroy");
-    cublasLtMatmulDescCreate = (cublasLtMatmulDescCreate_t)dlsym(
+    hipblasLtDestroy =
+        (hipblasLtDestroy_t)dlsym(dylibHandle, "hipblasLtDestroy");
+    hipblasLtMatmulDescCreate = (hipblasLtMatmulDescCreate_t)dlsym(
         dylibHandle, "hipblasLtMatmulDescCreate");
     hipblasLtMatmulDescDestroy = (hipblasLtMatmulDescDestroy_t)dlsym(
         dylibHandle, "hipblasLtMatmulDescDestroy");
@@ -93,8 +95,9 @@ class HipBlasLtInstance {
         dylibHandle, "hipblasLtMatrixLayoutDestroy");
     hipblasLtMatmulPreferenceCreate = (hipblasLtMatmulPreferenceCreate_t)dlsym(
         dylibHandle, "hipblasLtMatmulPreferenceCreate");
-    hipblasLtMatmulPreferenceDestroy = (hipblasLtMatmulPreferenceDestroy_t)dlsym(
-        dylibHandle, "hipblasLtMatmulPreferenceDestroy");
+    hipblasLtMatmulPreferenceDestroy =
+        (hipblasLtMatmulPreferenceDestroy_t)dlsym(
+            dylibHandle, "hipblasLtMatmulPreferenceDestroy");
     hipblasLtMatmulPreferenceSetAttribute =
         (hipblasLtMatmulPreferenceSetAttribute_t)dlsym(
             dylibHandle, "hipblasLtMatmulPreferenceSetAttribute");
@@ -120,7 +123,7 @@ class HipBlasLtInstance {
   }
 
   void gemm_impl(int m, int n, int k, uint64_t A, uint64_t B, uint64_t C,
-                 uint64_t D, cudaDataType_t dtype, float alpha, float beta) {
+                 uint64_t D, hipData_t dtype, float alpha, float beta) {
     hipblasLtMatmulDesc_t matmulDesc = NULL;
 
     hipblasOperation_t transa = HIPBLAS_OP_T;
@@ -129,29 +132,29 @@ class HipBlasLtInstance {
     int8_t fastAccum = 1;
 
     hipblasLtMatrixLayout_t Adesc = NULL, Bdesc = NULL, Cdesc = NULL,
-                           Ddesc = NULL;
+                            Ddesc = NULL;
 
     int returnedResults = 0;
     hipblasLtMatmulHeuristicResult_t heuristicResult = {};
 
     // Select compute type. Use TF32 when inputs are FP32, otherwise default
     // FP32 accumulation.
-    hipblasComputeType_t computeType = (dtype == CUDA_R_32F)
-                                          ? CUBLAS_COMPUTE_32F_FAST_TF32
-                                          : CUBLAS_COMPUTE_32F;
+    hipblasComputeType_t computeType = (dtype == HIP_R_32F)
+                                           ? HIPBLAS_COMPUTE_32F_FAST_TF32
+                                           : HIPBLAS_COMPUTE_32F;
     successOrExit(
-        hipblasLtMatmulDescCreate(&matmulDesc, computeType, CUDA_R_32F));
+        hipblasLtMatmulDescCreate(&matmulDesc, computeType, HIP_R_32F));
     successOrExit(hipblasLtMatmulDescSetAttribute(
-        matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+        matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
     successOrExit(hipblasLtMatmulDescSetAttribute(
-        matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
-    if (dtype == CUDA_R_8F_E4M3) {
+        matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+    if (dtype == HIP_R_8F_E4M3_FNUZ) {
       successOrExit(hipblasLtMatmulDescSetAttribute(
-          matmulDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAccum,
+          matmulDesc, HIPBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAccum,
           sizeof(fastAccum)));
     }
 
-    auto c_dtype = dtype == CUDA_R_8F_E4M3 ? CUDA_R_16F : dtype;
+    auto c_dtype = dtype == HIP_R_8F_E4M3_FNUZ ? HIP_R_16F : dtype;
     successOrExit(hipblasLtMatrixLayoutCreate(&Adesc, dtype, k, m, k));
     successOrExit(hipblasLtMatrixLayoutCreate(&Bdesc, dtype, k, n, k));
     successOrExit(hipblasLtMatrixLayoutCreate(&Cdesc, c_dtype, m, n, m));
@@ -165,10 +168,10 @@ class HipBlasLtInstance {
           "No valid algorithm found by hipblasLtMatmulAlgoGetHeuristic");
     }
 
-    successOrExit(hipblasLtMatmul(ltHandle, matmulDesc, &alpha, (void *)A, Adesc,
-                                 (void *)B, Bdesc, &beta, (void *)C, Cdesc,
-                                 (void *)D, Ddesc, &heuristicResult.algo,
-                                 (void *)workspace, workspaceSize, 0));
+    successOrExit(hipblasLtMatmul(
+        ltHandle, matmulDesc, &alpha, (void *)A, Adesc, (void *)B, Bdesc, &beta,
+        (void *)C, Cdesc, (void *)D, Ddesc, &heuristicResult.algo,
+        (void *)workspace, workspaceSize, 0));
     if (Ddesc)
       successOrExit(hipblasLtMatrixLayoutDestroy(Ddesc));
     if (Cdesc)
@@ -189,7 +192,7 @@ public:
 
     successOrExit(hipblasLtMatmulPreferenceCreate(&preference));
     successOrExit(hipblasLtMatmulPreferenceSetAttribute(
-        preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize,
+        preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize,
         sizeof(workspaceSize)));
   }
   ~HipBlasLtInstance() {
@@ -207,16 +210,15 @@ public:
   // ensuring that the matrices are in the correct format and have the correct
   // dimensions.
   void matmul(int m, int n, int k, uint64_t A, uint64_t B, uint64_t C,
-              cudaDataType_t dtype) {
+              hipData_t dtype) {
     // CUDA is column-major, while triton is row-major, therefore we need to
     // reverse the order of the matrices ( A * B = (B^T * A^T)^T ).
     gemm_impl(n, m, k, B, A, 0, C, dtype, 1.0f, 0.0f);
   }
 
   void gemm(int m, int n, int k, uint64_t A, uint64_t B, uint64_t C, uint64_t D,
-            cudaDataType_t dtype, float alpha, float beta) {
+            hipData_t dtype, float alpha, float beta) {
     gemm_impl(n, m, k, B, A, C, D, dtype, alpha, beta);
   }
-  
-}
+};
 #endif // TRITON_HIPBLAS_INSTANCE_H

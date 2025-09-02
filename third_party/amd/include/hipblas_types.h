@@ -1,5 +1,5 @@
 #ifndef TRITON_HIPBLAS_TYPES_H
-#define TRITON_HIPBLAS_TYPES_H    
+#define TRITON_HIPBLAS_TYPES_H
 
 #include <cstddef>
 #include <cstdint>
@@ -111,37 +111,37 @@ typedef struct {
   int reserved[4];
 } hipblasLtMatmulHeuristicResult_t;
 
-typedef enum hipDataType_t {
-  HIP_R_16F = 2,      /* real as a half */
-  HIP_C_16F = 6,      /* complex as a pair of half numbers */
-  HIP_R_16BF = 14,    /* real as a nv_bfloat16 */
-  HIP_C_16BF = 15,    /* complex as a pair of nv_bfloat16 numbers */
-  HIP_R_32F = 0,      /* real as a float */
-  HIP_C_32F = 4,      /* complex as a pair of float numbers */
-  HIP_R_64F = 1,      /* real as a double */
-  HIP_C_64F = 5,      /* complex as a pair of double numbers */
-  HIP_R_4I = 16,      /* real as a signed 4-bit int */
-  HIP_C_4I = 17,      /* complex as a pair of signed 4-bit int numbers */
-  HIP_R_4U = 18,      /* real as a unsigned 4-bit int */
-  HIP_C_4U = 19,      /* complex as a pair of unsigned 4-bit int numbers */
-  HIP_R_8I = 3,       /* real as a signed 8-bit int */
-  HIP_C_8I = 7,       /* complex as a pair of signed 8-bit int numbers */
-  HIP_R_8U = 8,       /* real as a unsigned 8-bit int */
-  HIP_C_8U = 9,       /* complex as a pair of unsigned 8-bit int numbers */
-  HIP_R_16I = 20,     /* real as a signed 16-bit int */
-  HIP_C_16I = 21,     /* complex as a pair of signed 16-bit int numbers */
-  HIP_R_16U = 22,     /* real as a unsigned 16-bit int */
-  HIP_C_16U = 23,     /* complex as a pair of unsigned 16-bit int numbers */
-  HIP_R_32I = 10,     /* real as a signed 32-bit int */
-  HIP_C_32I = 11,     /* complex as a pair of signed 32-bit int numbers */
-  HIP_R_32U = 12,     /* real as a unsigned 32-bit int */
-  HIP_C_32U = 13,     /* complex as a pair of unsigned 32-bit int numbers */
-  HIP_R_64I = 24,     /* real as a signed 64-bit int */
-  HIP_C_64I = 25,     /* complex as a pair of signed 64-bit int numbers */
-  HIP_R_64U = 26,     /* real as a unsigned 64-bit int */
-  HIP_C_64U = 27,     /* complex as a pair of unsigned 64-bit int numbers */
-  HIP_R_8F_E4M3_FNUZ = 28,  /* real as a hip_fp8_e4m3_fnuz */
-  HIP_R_8F_E5M2_FNUZ = 29,  /* real as a hip_fp8_e5m2_fnuz */
+typedef enum hipData_t {
+  HIP_R_16F = 2,   /* real as a half */
+  HIP_C_16F = 6,   /* complex as a pair of half numbers */
+  HIP_R_16BF = 14, /* real as a nv_bfloat16 */
+  HIP_C_16BF = 15, /* complex as a pair of nv_bfloat16 numbers */
+  HIP_R_32F = 0,   /* real as a float */
+  HIP_C_32F = 4,   /* complex as a pair of float numbers */
+  HIP_R_64F = 1,   /* real as a double */
+  HIP_C_64F = 5,   /* complex as a pair of double numbers */
+  HIP_R_4I = 16,   /* real as a signed 4-bit int */
+  HIP_C_4I = 17,   /* complex as a pair of signed 4-bit int numbers */
+  HIP_R_4U = 18,   /* real as a unsigned 4-bit int */
+  HIP_C_4U = 19,   /* complex as a pair of unsigned 4-bit int numbers */
+  HIP_R_8I = 3,    /* real as a signed 8-bit int */
+  HIP_C_8I = 7,    /* complex as a pair of signed 8-bit int numbers */
+  HIP_R_8U = 8,    /* real as a unsigned 8-bit int */
+  HIP_C_8U = 9,    /* complex as a pair of unsigned 8-bit int numbers */
+  HIP_R_16I = 20,  /* real as a signed 16-bit int */
+  HIP_C_16I = 21,  /* complex as a pair of signed 16-bit int numbers */
+  HIP_R_16U = 22,  /* real as a unsigned 16-bit int */
+  HIP_C_16U = 23,  /* complex as a pair of unsigned 16-bit int numbers */
+  HIP_R_32I = 10,  /* real as a signed 32-bit int */
+  HIP_C_32I = 11,  /* complex as a pair of signed 32-bit int numbers */
+  HIP_R_32U = 12,  /* real as a unsigned 32-bit int */
+  HIP_C_32U = 13,  /* complex as a pair of unsigned 32-bit int numbers */
+  HIP_R_64I = 24,  /* real as a signed 64-bit int */
+  HIP_C_64I = 25,  /* complex as a pair of signed 64-bit int numbers */
+  HIP_R_64U = 26,  /* real as a unsigned 64-bit int */
+  HIP_C_64U = 27,  /* complex as a pair of unsigned 64-bit int numbers */
+  HIP_R_8F_E4M3_FNUZ = 28, /* real as a hip_fp8_e4m3_fnuz */
+  HIP_R_8F_E5M2_FNUZ = 29, /* real as a hip_fp8_e5m2_fnuz */
 } hipDataType;
 
 struct hipblasContext;
