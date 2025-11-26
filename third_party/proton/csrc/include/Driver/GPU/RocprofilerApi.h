@@ -23,6 +23,12 @@ struct ExternLibRocprofiler : public ExternLibBase {
   static constexpr const char *symbolName = "rocprofiler_is_initialized";
   static constexpr const char *pathEnv{};
   static constexpr RetType success = ROCPROFILER_STATUS_SUCCESS;
+  // rocprofiler-sdk requires RTLD_GLOBAL (0x100) so its symbols are visible to
+  // the HIP runtime for function interception. Without this, callback tracing
+  // won't work because rocprofiler can't intercept HIP API calls.
+  // We use numeric values to avoid conflicts with ROCm headers.
+  // RTLD_GLOBAL = 0x100, RTLD_LAZY = 0x001
+  static constexpr int dlopenFlags = 0x100 | 0x001;
   static inline void *lib = nullptr;
 };
 

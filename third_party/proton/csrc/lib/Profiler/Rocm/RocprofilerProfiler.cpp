@@ -141,13 +141,35 @@ bool isKernelLaunchOperation(rocprofiler_tracing_operation_t op) {
 
 void ensureRocprofilerConfigured() {
   std::call_once(configureOnce, []() {
+    std::cerr << "[PROTON DEBUG] ensureRocprofilerConfigured: first call"
+              << std::endl;
+
+    // Check if already configured (e.g., by preload library)
+    auto &state = getRuntimeState();
+    if (state.configured) {
+      std::cerr << "[PROTON DEBUG] Already configured (via preload)"
+                << std::endl;
+      return;
+    }
+
     int status = 0;
     rocprofiler::isInitialized<true>(&status);
+    std::cerr << "[PROTON DEBUG] isInitialized status=" << status << std::endl;
     if (status > 0) {
+      // rocprofiler is initialized but not by us - check if our state is
+      // configured This can happen if preload library set things up
+      if (state.configured) {
+        std::cerr << "[PROTON DEBUG] rocprofiler configured by our preload"
+                  << std::endl;
+        return;
+      }
       throw std::runtime_error(
           "[PROTON] ROCProfiler-SDK is already configured by another tool");
     }
+    std::cerr << "[PROTON DEBUG] calling forceConfigure" << std::endl;
     auto ret = rocprofiler::forceConfigure<true>(&rocprofiler_configure);
+    std::cerr << "[PROTON DEBUG] forceConfigure returned "
+              << static_cast<int>(ret) << std::endl;
     if (ret != ROCPROFILER_STATUS_SUCCESS) {
       throw std::runtime_error(
           "[PROTON] Failed to configure ROCProfiler-SDK runtime");
@@ -169,12 +191,17 @@ struct RocprofilerProfiler::RocprofilerProfilerPimpl
   virtual ~RocprofilerProfilerPimpl() = default;
 
   void doStart() override {
+    std::cerr << "[PROTON DEBUG] doStart called" << std::endl;
     ensureRocprofilerConfigured();
     auto &state = getRuntimeState();
+    std::cerr << "[PROTON DEBUG] doStart: configured=" << state.configured
+              << ", started=" << state.started << std::endl;
     std::lock_guard<std::mutex> lock(state.mutex);
     if (!state.started) {
+      std::cerr << "[PROTON DEBUG] doStart: calling startContext" << std::endl;
       rocprofiler::startContext<true>(state.context);
       state.started = true;
+      std::cerr << "[PROTON DEBUG] doStart: context started" << std::endl;
     }
   }
 
@@ -214,8 +241,17 @@ struct RocprofilerProfiler::RocprofilerProfilerPimpl
                     std::unordered_map<uint64_t, std::string>>;
 
   std::string getKernelName(uint64_t kernelId) {
-    if (kernelNames.contain(kernelId))
-      return kernelNames[kernelId];
+    if (kernelNames.contain(kernelId)) {
+      std::string name = kernelNames[kernelId];
+      // Strip ".kd" suffix (AMD kernel descriptor) for consistency
+      const std::string suffix = ".kd";
+      if (name.size() > suffix.size() &&
+          name.compare(name.size() - suffix.size(), suffix.size(), suffix) ==
+              0) {
+        name = name.substr(0, name.size() - suffix.size());
+      }
+      return name;
+    }
     return UnknownKernelName;
   }
 
@@ -255,6 +291,11 @@ namespace {} // namespace
 void RocprofilerProfiler::RocprofilerProfilerPimpl::hipRuntimeCallback(
     rocprofiler_callback_tracing_record_t record,
     rocprofiler_user_data_t *userData, void *arg) {
+  static bool firstCall = true;
+  if (firstCall) {
+    std::cerr << "[PROTON DEBUG] hipRuntimeCallback first call!" << std::endl;
+    firstCall = false;
+  }
   if (record.kind != ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API)
     return;
 
@@ -407,6 +448,8 @@ void RocprofilerProfiler::RocprofilerProfilerPimpl::kernelBufferCallback(
     rocprofiler_context_id_t context, rocprofiler_buffer_id_t buffer,
     rocprofiler_record_header_t **headers, size_t numHeaders, void *userData,
     uint64_t dropCount) {
+  std::cerr << "[PROTON DEBUG] kernelBufferCallback called, numHeaders="
+            << numHeaders << std::endl;
   if (dropCount > 0) {
     std::cerr << "[PROTON] ROCProfiler-SDK dropped " << dropCount
               << " kernel dispatch records" << std::endl;
@@ -518,18 +561,25 @@ rocprofiler_configure(uint32_t version, const char *runtimeVersion,
 namespace {
 
 int proton_tool_init(rocprofiler_client_finalize_t finiFunc, void *toolData) {
+  std::cerr << "[PROTON DEBUG] proton_tool_init called" << std::endl;
   auto *state = static_cast<RocprofilerRuntimeState *>(toolData);
   state->finalizeFunc = finiFunc;
 
+  std::cerr << "[PROTON DEBUG] creating context" << std::endl;
   rocprofiler::createContext<true>(&state->context);
+  std::cerr << "[PROTON DEBUG] context created" << std::endl;
 
   bool enableMarkers = getBoolEnv("TRITON_ENABLE_NVTX", true);
   state->markerCallbacksEnabled = enableMarkers;
 
-  rocprofiler::configureCallbackTracingService<true>(
+  std::cerr << "[PROTON DEBUG] configuring HIP runtime callback tracing"
+            << std::endl;
+  auto ret1 = rocprofiler::configureCallbackTracingService<true>(
       state->context, ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API, nullptr, 0,
       &RocprofilerProfiler::RocprofilerProfilerPimpl::hipRuntimeCallback,
       nullptr);
+  std::cerr << "[PROTON DEBUG] HIP callback tracing configured: "
+            << static_cast<int>(ret1) << std::endl;
 
   if (enableMarkers) {
     rocprofiler::configureCallbackTracingService<true>(
@@ -540,24 +590,36 @@ int proton_tool_init(rocprofiler_client_finalize_t finiFunc, void *toolData) {
 
   const rocprofiler_tracing_operation_t codeObjectOps[] = {
       ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER};
-  rocprofiler::configureCallbackTracingService<true>(
+  std::cerr << "[PROTON DEBUG] configuring code object callback" << std::endl;
+  auto ret2 = rocprofiler::configureCallbackTracingService<true>(
       state->context, ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT, codeObjectOps,
       1, &RocprofilerProfiler::RocprofilerProfilerPimpl::codeObjectCallback,
       nullptr);
+  std::cerr << "[PROTON DEBUG] code object callback configured: "
+            << static_cast<int>(ret2) << std::endl;
 
   size_t watermark = BufferSize - (BufferSize / 8);
-  rocprofiler::createBuffer<true>(
+  std::cerr << "[PROTON DEBUG] creating buffer" << std::endl;
+  auto ret3 = rocprofiler::createBuffer<true>(
       state->context, BufferSize, watermark, ROCPROFILER_BUFFER_POLICY_LOSSLESS,
       &RocprofilerProfiler::RocprofilerProfilerPimpl::kernelBufferCallback,
       nullptr, &state->kernelBuffer);
+  std::cerr << "[PROTON DEBUG] buffer created: " << static_cast<int>(ret3)
+            << std::endl;
 
-  rocprofiler::configureBufferTracingService<true>(
+  std::cerr << "[PROTON DEBUG] configuring kernel dispatch buffer tracing"
+            << std::endl;
+  auto ret4 = rocprofiler::configureBufferTracingService<true>(
       state->context, ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH, nullptr, 0,
       state->kernelBuffer);
+  std::cerr << "[PROTON DEBUG] kernel dispatch buffer tracing configured: "
+            << static_cast<int>(ret4) << std::endl;
 
   rocprofiler::createCallbackThread<true>(&state->callbackThread);
   rocprofiler::assignCallbackThread<true>(state->kernelBuffer,
                                           state->callbackThread);
+  std::cerr << "[PROTON DEBUG] callback thread created and assigned"
+            << std::endl;
 
   int valid = 0;
   rocprofiler::contextIsValid<true>(state->context, &valid);
@@ -588,7 +650,9 @@ void proton_tool_fini(void *toolData) {
 
 } // namespace
 
-extern "C" rocprofiler_tool_configure_result_t *
+// Must be exported globally for rocprofiler-sdk to find it
+extern "C" __attribute__((visibility("default")))
+rocprofiler_tool_configure_result_t *
 rocprofiler_configure(uint32_t version, const char *runtimeVersion,
                       uint32_t priority, rocprofiler_client_id_t *id) {
   auto &state = getRuntimeState();

@@ -4,6 +4,7 @@
 #include <dlfcn.h>
 
 #include "Utility/Env.h"
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -63,6 +64,10 @@ struct ExternLibBase {
   static constexpr const char *symbolName{}; // Placeholder
   static constexpr const char *pathEnv{};    // Placeholder
   static constexpr RetType success = 0;      // Placeholder
+  // Default dlopen flags - can be overridden in derived structs
+  // Some libraries (like rocprofiler-sdk) need RTLD_GLOBAL for proper
+  // interception
+  static constexpr int dlopenFlags = RTLD_LOCAL | RTLD_LAZY;
   ExternLibBase() = delete;
   ExternLibBase(const ExternLibBase &) = delete;
   ExternLibBase &operator=(const ExternLibBase &) = delete;
@@ -80,7 +85,9 @@ public:
           ExternLib::pathEnv == nullptr ? "" : getStrEnv(ExternLib::pathEnv);
       if (!dir.empty()) {
         auto fullPath = dir + "/" + name;
-        *lib = dlopen(fullPath.c_str(), RTLD_LOCAL | RTLD_LAZY);
+        std::cerr << "[PROTON DEBUG] dlopen from pathEnv: " << fullPath
+                  << " flags=" << ExternLib::dlopenFlags << std::endl;
+        *lib = dlopen(fullPath.c_str(), ExternLib::dlopenFlags);
       } else {
         // Only if the default path is not set, we try to load it from the
         // system.
@@ -88,7 +95,12 @@ public:
         *lib = dlopen(name, RTLD_NOLOAD);
         if (*lib == nullptr) {
           // If not found, try to load it from LD_LIBRARY_PATH
-          *lib = dlopen(name, RTLD_LOCAL | RTLD_LAZY);
+          std::cerr << "[PROTON DEBUG] dlopen " << name
+                    << " flags=" << ExternLib::dlopenFlags << std::endl;
+          *lib = dlopen(name, ExternLib::dlopenFlags);
+        } else {
+          std::cerr << "[PROTON DEBUG] dlopen RTLD_NOLOAD found " << name
+                    << " already loaded" << std::endl;
         }
       }
     }
