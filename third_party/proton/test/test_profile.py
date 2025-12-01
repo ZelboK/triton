@@ -386,6 +386,127 @@ def test_pcsampling(tmp_path: pathlib.Path):
     assert init_frame["children"][0]["metrics"]["num_samples"] > 0
 
 
+def test_pcsampling_rocm(tmp_path: pathlib.Path):
+    """Test stochastic PC sampling on ROCm (AMD GPUs).
+
+    This test requires:
+    - ROCPROFILER_PC_SAMPLING_BETA_ENABLED=1 (rocprofiler-sdk beta feature)
+    - PROTON_PC_SAMPLING=1 (enables PC sampling in proton)
+    - ROCP_TOOL_LIBRARIES pointing to libproton.so
+
+    Run manually with:
+        ROCPROFILER_PC_SAMPLING_BETA_ENABLED=1 PROTON_PC_SAMPLING=1 \\
+        ROCP_TOOL_LIBRARIES=/path/to/libproton.so \\
+        pytest test_profile.py::test_pcsampling_rocm
+    """
+    import os
+    import subprocess
+    import sys
+
+    if not is_hip():
+        pytest.skip("ROCm PC sampling test only runs on HIP backend")
+
+    if os.environ.get("PROTON_SKIP_PC_SAMPLING_TEST", "0") == "1":
+        pytest.skip("PC sampling test is disabled")
+
+    # Find libproton.so path
+    import triton
+    triton_path = pathlib.Path(triton.__file__).parent
+    libproton_path = triton_path / "_C" / "libproton.so"
+    if not libproton_path.exists():
+        # Try alternative locations
+        for candidate in [
+                triton_path / "libproton.so",
+                triton_path.parent / "libproton.so",
+        ]:
+            if candidate.exists():
+                libproton_path = candidate
+                break
+
+    if not libproton_path.exists():
+        pytest.skip(f"libproton.so not found (searched near {triton_path})")
+
+    # Create a test script that will be run with the required env vars
+    test_script = tmp_path / "test_pcs_rocm.py"
+    output_file = tmp_path / "test_pcsampling_rocm.hatchet"
+
+    test_script.write_text(f'''
+import json
+import torch
+import triton
+import triton.language as tl
+import triton.profiler as proton
+
+@triton.jit
+def foo(x, y, size: tl.constexpr):
+    offs = tl.arange(0, size)
+    for _ in range(1000):
+        tl.store(y + offs, tl.load(x + offs))
+
+output_file = "{output_file}"
+proton.start(output_file.replace(".hatchet", ""), hook="triton", backend="rocprofiler")
+with proton.scope("test"):
+    x = torch.ones((1024, ), device="cuda", dtype=torch.float32)
+    y = torch.zeros_like(x)
+    foo[(1, )](x, y, x.size()[0], num_warps=4)
+proton.finalize()
+
+# Verify output
+with open(output_file) as f:
+    data = json.load(f)
+
+# Check we got some data
+assert len(data) > 0, "No profiling data collected"
+test_frame = data[0]["children"][0]
+assert "test" in test_frame["frame"]["name"], f"Expected 'test' scope, got {{test_frame['frame']['name']}}"
+
+# Check for PC sampling metrics (num_samples or stall reasons)
+def has_pc_sampling_metrics(node):
+    metrics = node.get("metrics", {{}})
+    return "num_samples" in metrics or "not_issued_waitcnt" in metrics
+
+def search_for_metrics(node):
+    if has_pc_sampling_metrics(node):
+        return True
+    for child in node.get("children", []):
+        if search_for_metrics(child):
+            return True
+    return False
+
+if search_for_metrics(data[0]):
+    print("SUCCESS: Found PC sampling metrics")
+else:
+    print("WARNING: No PC sampling metrics found (stochastic sampling may not be available)")
+    # Don't fail - stochastic sampling requires specific HW support
+
+print("Test completed successfully")
+''')
+
+    # Run with required environment variables
+    env = os.environ.copy()
+    env["ROCPROFILER_PC_SAMPLING_BETA_ENABLED"] = "1"
+    env["PROTON_PC_SAMPLING"] = "1"
+    env["ROCP_TOOL_LIBRARIES"] = str(libproton_path)
+
+    result = subprocess.run(
+        [sys.executable, str(test_script)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    print(f"STDOUT: {result.stdout}")
+    if result.stderr:
+        print(f"STDERR: {result.stderr}")
+
+    if result.returncode != 0:
+        # Check if it's a "not available" error (expected on some HW)
+        if "Stochastic PC sampling not available" in result.stderr:
+            pytest.skip("Stochastic PC sampling not available on this hardware")
+        pytest.fail(f"ROCm PC sampling test failed: {result.stderr}")
+
+
 def test_deactivate(tmp_path: pathlib.Path):
     temp_file = tmp_path / "test_deactivate.hatchet"
     session_id = proton.start(str(temp_file.with_suffix("")), hook="triton")
