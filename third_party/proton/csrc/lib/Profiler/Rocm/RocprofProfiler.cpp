@@ -158,8 +158,21 @@ void ensureRocprofilerConfigured() {
     int status = 0;
     rocprofiler::isInitialized<true>(&status);
     if (status > 0) {
-      // rocprofiler is initialized - check if by us (via ROCP_TOOL_LIBRARIES)
+      // rocprofiler is initialized - check if this is our PC sampling setup
+      // When ROCP_TOOL_LIBRARIES loads libproton.so, it gets a separate static
+      // state from the Python-loaded version. Check if PC sampling was enabled
+      // via environment variable - if so, we configured it ourselves.
       if (state.configured) {
+        return;
+      }
+      bool pcSamplingEnabled = getBoolEnv("PROTON_PC_SAMPLING", false);
+      if (pcSamplingEnabled) {
+        // PC sampling was configured via ROCP_TOOL_LIBRARIES - mark this
+        // instance as configured and continue
+        state.configured = true;
+        std::cerr << "[PROTON] Using PC sampling configuration from "
+                     "ROCP_TOOL_LIBRARIES"
+                  << std::endl;
         return;
       }
       throw std::runtime_error(
@@ -191,7 +204,13 @@ struct RocprofProfiler::RocprofProfilerPimpl
     auto &state = getRuntimeState();
     std::lock_guard<std::mutex> lock(state.mutex);
     if (!state.started) {
-      rocprofiler::startContext<true>(state.context);
+      // When PC sampling is configured via ROCP_TOOL_LIBRARIES, the context
+      // is managed by the other library instance. Check if we're in that mode
+      // by seeing if our context handle is invalid (0).
+      if (state.context.handle != 0) {
+        rocprofiler::startContext<true>(state.context);
+      }
+      // Even if we didn't start a context, mark as started to prevent retries
       state.started = true;
     }
   }
@@ -200,6 +219,14 @@ struct RocprofProfiler::RocprofProfilerPimpl
     ensureRocprofilerConfigured();
     auto &state = getRuntimeState();
     std::ignore = hip::deviceSynchronize<true>();
+
+    // When PC sampling is configured via ROCP_TOOL_LIBRARIES, this instance
+    // doesn't have valid buffers - the other instance handles flushing
+    if (state.context.handle == 0) {
+      // No-op for the Python instance when using ROCP_TOOL_LIBRARIES
+      return;
+    }
+
     if (state.pcSamplingEnabled) {
       profiler.correlation.flush(
           /*maxRetries=*/100, /*sleepMs=*/10,
@@ -219,7 +246,11 @@ struct RocprofProfiler::RocprofProfilerPimpl
     auto &state = getRuntimeState();
     std::lock_guard<std::mutex> lock(state.mutex);
     if (state.started) {
-      rocprofiler::stopContext<true>(state.context);
+      // Only stop context if we have a valid handle (not the Python instance
+      // when using ROCP_TOOL_LIBRARIES)
+      if (state.context.handle != 0) {
+        rocprofiler::stopContext<true>(state.context);
+      }
       state.started = false;
     }
   }
@@ -536,23 +567,35 @@ void RocprofProfiler::RocprofProfilerPimpl::pcSamplingBufferCallback(
     rocprofiler_context_id_t context, rocprofiler_buffer_id_t buffer,
     rocprofiler_record_header_t **headers, size_t numHeaders, void *userData,
     uint64_t dropCount) {
+
+  static size_t totalSamplesReceived = 0;
+  totalSamplesReceived += numHeaders;
+
+  std::cerr << "[PROTON PC_SAMPLING] Callback invoked: " << numHeaders
+            << " samples (total so far: " << totalSamplesReceived << ")";
   if (dropCount > 0) {
-    std::cerr << "[PROTON] ROCProfiler-SDK dropped " << dropCount
-              << " PC sampling records" << std::endl;
+    std::cerr << ", DROPPED: " << dropCount;
   }
+  std::cerr << std::endl;
 
   auto &profiler = RocprofProfiler::instance();
   auto *impl = static_cast<RocprofProfiler::RocprofProfilerPimpl *>(
       profiler.pImpl.get());
   auto dataSet = profiler.getDataSet();
 
+  size_t stochasticSamples = 0;
+  size_t stalledSamples = 0;
+
   for (size_t i = 0; i < numHeaders; ++i) {
     auto *header = headers[i];
     if (header->category != ROCPROFILER_BUFFER_CATEGORY_PC_SAMPLING) {
+      std::cerr << "[PROTON PC_SAMPLING] Warning: Unexpected category "
+                << header->category << std::endl;
       continue;
     }
 
     if (header->kind == ROCPROFILER_PC_SAMPLING_RECORD_STOCHASTIC_V0_SAMPLE) {
+      stochasticSamples++;
       auto *sample =
           static_cast<rocprofiler_pc_sampling_record_stochastic_v0_t *>(
               header->payload);
@@ -563,7 +606,6 @@ void RocprofProfiler::RocprofProfilerPimpl::pcSamplingBufferCallback(
       bool isStalled = !sample->wave_issued;
 
       if (isStalled) {
-        // Map rocprofiler reason to our metric kind
         auto reason = static_cast<
             rocprofiler_pc_sampling_instruction_not_issued_reason_t>(
             sample->snapshot.reason_not_issued);
@@ -604,7 +646,26 @@ void RocprofProfiler::RocprofProfilerPimpl::pcSamplingBufferCallback(
         }
       }
 
-      // Create metric
+      if (isStalled) {
+        stalledSamples++;
+      }
+
+      // Debug output for first few samples
+      if (stochasticSamples <= 5) {
+        std::cerr << "[PROTON PC_SAMPLING] Sample #" << stochasticSamples
+                  << ": "
+                  << "code_obj_id=" << sample->pc.code_object_id << " offset=0x"
+                  << std::hex << sample->pc.code_object_offset << std::dec
+                  << " corr_id=" << sample->correlation_id.internal
+                  << " wave_issued=" << (int)sample->wave_issued
+                  << " timestamp=" << sample->timestamp;
+        if (isStalled) {
+          std::cerr << " STALLED(reason=" << sample->snapshot.reason_not_issued
+                    << ")";
+        }
+        std::cerr << std::endl;
+      }
+
       auto metric = std::make_shared<RocprofPCSamplingMetric>(
           stallKind, 1, isStalled ? 1 : 0);
 
@@ -620,6 +681,13 @@ void RocprofProfiler::RocprofProfilerPimpl::pcSamplingBufferCallback(
                     .first
               : Scope::DummyScopeId;
 
+      // Debug correlation lookup
+      if (stochasticSamples <= 5) {
+        std::cerr << "[PROTON PC_SAMPLING]   Correlation lookup: "
+                  << "hasCorrelation=" << hasCorrelation
+                  << " externId=" << externId << std::endl;
+      }
+
       // Add metric to data
       for (auto *data : dataSet) {
         data->addMetric(externId, metric);
@@ -627,6 +695,10 @@ void RocprofProfiler::RocprofProfilerPimpl::pcSamplingBufferCallback(
     }
     // Only stochastic sampling is supported - ignore other record types
   }
+
+  std::cerr << "[PROTON PC_SAMPLING] Processed " << stochasticSamples
+            << " stochastic samples (" << stalledSamples << " stalled)"
+            << std::endl;
 }
 
 RocprofProfiler::RocprofProfiler() {
@@ -656,7 +728,6 @@ rocprofiler_configure(uint32_t version, const char *runtimeVersion,
 namespace {
 
 // Helper to configure stochastic PC sampling for a single agent
-// NOTE: Only stochastic sampling is supported - no host_trap fallback
 bool configurePCSamplingForAgent(RocprofilerRuntimeState *state,
                                  rocprofiler_agent_id_t agentId) {
   struct ConfigData {
@@ -692,7 +763,6 @@ bool configurePCSamplingForAgent(RocprofilerRuntimeState *state,
     return false;
   }
 
-  // Only stochastic sampling is supported
   if (!configData.hasStochastic) {
     std::cerr << "[PROTON] Stochastic PC sampling not available for agent. "
               << "Ensure ROCPROFILER_PC_SAMPLING_BETA_ENABLED=1 is set."
@@ -700,9 +770,9 @@ bool configurePCSamplingForAgent(RocprofilerRuntimeState *state,
     return false;
   }
 
-  // Use a reasonable interval (2^20 cycles is common)
+  // this should be configurable probably
   uint64_t interval =
-      std::max(configData.stochasticMinInterval, uint64_t(1048576));
+      std::max(configData.stochasticMinInterval, uint64_t(65536));
   // Clamp to max if needed
   if (configData.stochasticMaxInterval > 0) {
     interval = std::min(interval, configData.stochasticMaxInterval);
@@ -718,8 +788,9 @@ bool configurePCSamplingForAgent(RocprofilerRuntimeState *state,
     return false;
   }
 
-  std::cerr << "[PROTON] Configured stochastic PC sampling with interval "
-            << interval << " cycles" << std::endl;
+  std::cerr << "[PROTON] ✓ Configured stochastic PC sampling for agent "
+            << agentId.handle << " with interval " << interval << " cycles"
+            << std::endl;
   return true;
 }
 
@@ -732,8 +803,22 @@ int proton_tool_init(rocprofiler_client_finalize_t finiFunc, void *toolData) {
   bool enableMarkers = getBoolEnv("TRITON_ENABLE_NVTX", true);
   state->markerCallbacksEnabled = enableMarkers;
 
-  bool enablePCSampling = getBoolEnv("PROTON_PC_SAMPLING", false);
+  bool enablePCSampling =
+      getBoolEnv("PROTON_PC_SAMPLING", true); // change later
   state->pcSamplingEnabled = enablePCSampling;
+
+  if (enablePCSampling) {
+    std::cerr << "[PROTON] PC sampling mode enabled via PROTON_PC_SAMPLING=1"
+              << std::endl;
+    // Check if beta flag is set
+    bool betaEnabled =
+        getBoolEnv("ROCPROFILER_PC_SAMPLING_BETA_ENABLED", false);
+    if (!betaEnabled) {
+      std::cerr << "[PROTON] WARNING: ROCPROFILER_PC_SAMPLING_BETA_ENABLED is "
+                   "not set. "
+                << "PC sampling may not work." << std::endl;
+    }
+  }
 
   rocprofiler::configureCallbackTracingService<true>(
       state->context, ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API, nullptr, 0,
@@ -759,7 +844,6 @@ int proton_tool_init(rocprofiler_client_finalize_t finiFunc, void *toolData) {
   AgentIdMapper::instance().initialize();
 
   if (enablePCSampling) {
-    // === PC SAMPLING MODE ===
     // Create PC sampling buffer
     rocprofiler::createBuffer<true>(
         state->context, BufferSize, watermark,
@@ -767,20 +851,27 @@ int proton_tool_init(rocprofiler_client_finalize_t finiFunc, void *toolData) {
         &RocprofProfiler::RocprofProfilerPimpl::pcSamplingBufferCallback,
         nullptr, &state->pcSamplingBuffer);
 
-    // Configure PC sampling for each GPU agent
+    std::cerr << "[PROTON] Configuring stochastic PC sampling for "
+              << AgentIdMapper::instance().getGpuAgentIds().size()
+              << " GPU agent(s)..." << std::endl;
+
     bool anyConfigured = false;
     for (const auto &agentId : AgentIdMapper::instance().getGpuAgentIds()) {
+      std::cerr << "[PROTON]   Attempting agent " << agentId.handle << "..."
+                << std::endl;
       if (configurePCSamplingForAgent(state, agentId)) {
         anyConfigured = true;
       }
     }
 
     if (!anyConfigured) {
-      std::cerr << "[PROTON] Warning: PC sampling requested but no agents "
+      std::cerr << "[PROTON] ERROR: PC sampling requested but no agents "
                    "support it. Falling back to kernel dispatch tracing."
                 << std::endl;
       state->pcSamplingEnabled = false;
     } else {
+      std::cerr << "[PROTON] ✓ PC sampling configured successfully"
+                << std::endl;
       rocprofiler::createCallbackThread<true>(&state->pcSamplingCallbackThread);
       rocprofiler::assignCallbackThread<true>(state->pcSamplingBuffer,
                                               state->pcSamplingCallbackThread);
@@ -788,7 +879,6 @@ int proton_tool_init(rocprofiler_client_finalize_t finiFunc, void *toolData) {
   }
 
   if (!state->pcSamplingEnabled) {
-    // === KERNEL DISPATCH TRACING MODE (default) ===
     rocprofiler::createBuffer<true>(
         state->context, BufferSize, watermark,
         ROCPROFILER_BUFFER_POLICY_LOSSLESS,
@@ -807,27 +897,37 @@ int proton_tool_init(rocprofiler_client_finalize_t finiFunc, void *toolData) {
   int valid = 0;
   rocprofiler::contextIsValid<true>(state->context, &valid);
   if (valid == 0) {
+    std::cerr << "[PROTON] ERROR: Context is invalid" << std::endl;
     return -1;
   }
 
+  rocprofiler::startContext<true>(state->context);
+  state->started = true;
   state->configured = true;
+
+  std::cerr << "[PROTON] ✓ Context started, profiling active" << std::endl;
   return 0;
 }
 
 void proton_tool_fini(void *toolData) {
+  std::cerr << "[PROTON] proton_tool_fini called" << std::endl;
   auto *state = static_cast<RocprofilerRuntimeState *>(toolData);
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->started) {
+      std::cerr << "[PROTON] Stopping context..." << std::endl;
       rocprofiler::stopContext<false>(state->context);
       state->started = false;
     }
   }
   if (state->pcSamplingEnabled) {
+    std::cerr << "[PROTON] Flushing PC sampling buffer..." << std::endl;
     rocprofiler::flushBuffer<false>(state->pcSamplingBuffer);
   } else {
+    std::cerr << "[PROTON] Flushing kernel buffer..." << std::endl;
     rocprofiler::flushBuffer<false>(state->kernelBuffer);
   }
+  std::cerr << "[PROTON] proton_tool_fini complete" << std::endl;
   if (state->finalizeFunc && state->clientId) {
     state->finalizeFunc(*state->clientId);
   }

@@ -432,54 +432,101 @@ def test_pcsampling_rocm(tmp_path: pathlib.Path):
 
     test_script.write_text(f'''
 import json
+import sys
 import torch
 import triton
 import triton.language as tl
 import triton.profiler as proton
 
+print("[TEST] Starting ROCm stochastic PC sampling test...", file=sys.stderr)
+
 @triton.jit
 def foo(x, y, size: tl.constexpr):
     offs = tl.arange(0, size)
+    # Long loop to generate many samples
     for _ in range(1000):
         tl.store(y + offs, tl.load(x + offs))
 
 output_file = "{output_file}"
+print(f"[TEST] Output file: {{output_file}}", file=sys.stderr)
+
 proton.start(output_file.replace(".hatchet", ""), hook="triton", backend="rocprofiler")
-with proton.scope("test"):
+
+print("[TEST] Profiler started, launching kernel...", file=sys.stderr)
+
+with proton.scope("test_scope"):
     x = torch.ones((1024, ), device="cuda", dtype=torch.float32)
     y = torch.zeros_like(x)
-    foo[(1, )](x, y, x.size()[0], num_warps=4)
-proton.finalize()
+    # Launch multiple times to increase sample count
+    for i in range(5):
+        foo[(1, )](x, y, x.size()[0], num_warps=4)
+        torch.cuda.synchronize()
 
-# Verify output
+print("[TEST] Kernel launched, finalizing...", file=sys.stderr)
+proton.finalize()
+print("[TEST] Finalized, checking output...", file=sys.stderr)
+
+# Verify output exists
+import os
+if not os.path.exists(output_file):
+    print(f"ERROR: Output file not created: {{output_file}}", file=sys.stderr)
+    sys.exit(1)
+
 with open(output_file) as f:
     data = json.load(f)
 
+print(f"[TEST] Loaded JSON with {{len(data)}} root nodes", file=sys.stderr)
+
 # Check we got some data
 assert len(data) > 0, "No profiling data collected"
-test_frame = data[0]["children"][0]
-assert "test" in test_frame["frame"]["name"], f"Expected 'test' scope, got {{test_frame['frame']['name']}}"
+root = data[0]
+print(f"[TEST] Root frame: {{root['frame']['name']}}", file=sys.stderr)
+print(f"[TEST] Root has {{len(root.get('children', []))}} children", file=sys.stderr)
 
-# Check for PC sampling metrics (num_samples or stall reasons)
-def has_pc_sampling_metrics(node):
-    metrics = node.get("metrics", {{}})
-    return "num_samples" in metrics or "not_issued_waitcnt" in metrics
+# Find test scope
+test_frame = None
+for child in root.get("children", []):
+    if "test_scope" in child["frame"]["name"]:
+        test_frame = child
+        break
 
-def search_for_metrics(node):
-    if has_pc_sampling_metrics(node):
-        return True
+if not test_frame:
+    print(f"ERROR: Could not find test_scope in output", file=sys.stderr)
+    print(f"Available children: {{[c['frame']['name'] for c in root.get('children', [])]}}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"[TEST] Test frame metrics: {{test_frame.get('metrics', {{}})}}", file=sys.stderr)
+
+# Recursively search for PC sampling metrics
+def count_metrics(node, metrics_dict=None):
+    if metrics_dict is None:
+        metrics_dict = {{}}{{'num_samples': 0, 'num_stalled_samples': 0}}
+
+    node_metrics = node.get("metrics", {{}})
+    if "num_samples" in node_metrics:
+        metrics_dict["num_samples"] += node_metrics["num_samples"]
+    if "num_stalled_samples" in node_metrics:
+        metrics_dict["num_stalled_samples"] += node_metrics["num_stalled_samples"]
+
     for child in node.get("children", []):
-        if search_for_metrics(child):
-            return True
-    return False
+        count_metrics(child, metrics_dict)
 
-if search_for_metrics(data[0]):
-    print("SUCCESS: Found PC sampling metrics")
+    return metrics_dict
+
+total_metrics = count_metrics(data[0])
+print(f"[TEST] Total metrics found: {{total_metrics}}", file=sys.stderr)
+
+if total_metrics["num_samples"] > 0:
+    print(f"\\n✓ SUCCESS: Found {{total_metrics['num_samples']}} PC samples!", file=sys.stderr)
+    print(f"  Stalled samples: {{total_metrics['num_stalled_samples']}}", file=sys.stderr)
 else:
-    print("WARNING: No PC sampling metrics found (stochastic sampling may not be available)")
-    # Don't fail - stochastic sampling requires specific HW support
+    print("\\nWARNING: No PC sampling metrics found", file=sys.stderr)
+    print("This may indicate:", file=sys.stderr)
+    print("  1. Stochastic sampling not available on this hardware", file=sys.stderr)
+    print("  2. ROCPROFILER_PC_SAMPLING_BETA_ENABLED not set", file=sys.stderr)
+    print("  3. Driver doesn't support PC sampling", file=sys.stderr)
 
-print("Test completed successfully")
+print("\\n[TEST] Test completed successfully")
 ''')
 
     # Run with required environment variables

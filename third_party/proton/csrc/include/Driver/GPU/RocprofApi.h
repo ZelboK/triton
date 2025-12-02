@@ -90,7 +90,7 @@ queryAvailableAgents(rocprofiler_agent_version_t version,
 template <bool CheckSuccess>
 rocprofiler_status_t queryPCSamplingAgentConfigurations(
     rocprofiler_agent_id_t agent_id,
-    rocprofiler_available_pc_sampling_configurations_cb_t cb, void *userData);
+    rocprofiler_available_pc_sampling_configurations_cb_t cb, void *user_data);
 
 template <bool CheckSuccess>
 rocprofiler_status_t configurePCSamplingService(
