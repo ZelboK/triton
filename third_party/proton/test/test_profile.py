@@ -708,7 +708,7 @@ def test_pcsampling_rocm(tmp_path: pathlib.Path, device: str):
     @triton.jit
     def foo(x, y, size: tl.constexpr):
         offs = tl.arange(0, size)
-        for _ in range(100000):
+        for _ in range(1000):
             tl.store(y + offs, tl.load(x + offs))
 
     temp_file = tmp_path / "test_pcsampling_rocm.hatchet"
@@ -716,7 +716,6 @@ def test_pcsampling_rocm(tmp_path: pathlib.Path, device: str):
     with proton.scope("test"):
         foo[(1, )](x=torch.ones((1024, ), device=device, dtype=torch.float32), y=torch.zeros(
             (1024, ), device=device, dtype=torch.float32), size=1024, num_warps=4)
-        torch.cuda.synchronize()
     proton.finalize()
 
     assert temp_file.exists(), "Profile output file was not created"
