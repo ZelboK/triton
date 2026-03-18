@@ -559,6 +559,11 @@ int protonToolInit(rocprofiler_client_finalize_t finiFunc, void *toolData) {
   if (valid == 0)
     return -1;
 
+  // Start the code object context immediately so it captures kernel symbols
+  // registered during API table re-propagation (force_configure path).
+  rocprofiler::startContext<true>(state->codeObjectContext);
+  state->codeObjectStarted = true;
+
   // Context 2: on-demand profiling context for HIP callback tracing and
   // kernel dispatch buffer tracing. Started/stopped in doStart()/doStop().
   // Registering BUFFER_TRACING_KERNEL_DISPATCH here causes
