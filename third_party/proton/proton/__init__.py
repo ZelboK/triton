@@ -11,8 +11,6 @@ from .profile import (
 )
 from . import context, specs, mode, data
 
-import sys
-
 
 def _eager_rocprofiler_init():
     try:

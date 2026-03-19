@@ -16,8 +16,10 @@
 #include "rocprofiler-sdk/callback_tracing.h"
 #include "rocprofiler-sdk/hip/api_args.h"
 #include "rocprofiler-sdk/hip/runtime_api_id.h"
+#include "rocprofiler-sdk/pc_sampling.h"
 #include "rocprofiler-sdk/registration.h"
 
+#include <atomic>
 #include <dlfcn.h>
 #include <iostream>
 #include <limits>
@@ -26,6 +28,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace proton {
 
@@ -41,6 +44,13 @@ constexpr const char *UnknownKernelName = "<unknown>";
 
 // ---- SDK runtime state (singleton, outlives any profiler instance) ----
 
+struct PcSamplingAgentInfo {
+  rocprofiler_agent_id_t agentId;
+  rocprofiler_pc_sampling_method_t method;
+  rocprofiler_pc_sampling_unit_t unit;
+  uint64_t interval;
+};
+
 struct RocprofilerRuntimeState {
   std::mutex mutex;
   rocprofiler_context_id_t codeObjectContext{};
@@ -52,11 +62,107 @@ struct RocprofilerRuntimeState {
   bool configured{false};
   bool codeObjectStarted{false};
   bool profilingStarted{false};
+
+  rocprofiler_context_id_t pcSamplingContext{};
+  std::vector<rocprofiler_buffer_id_t> pcSamplingBuffers;
+  rocprofiler_callback_thread_t pcSamplingThread{};
+  std::vector<PcSamplingAgentInfo> pcSamplingAgents;
+  bool pcSamplingConfigured{false};
+  bool pcSamplingStarted{false};
+  std::atomic<uint64_t> pcSampleCount{0};
 };
 
 RocprofilerRuntimeState &getRuntimeState() {
   static RocprofilerRuntimeState state;
   return state;
+}
+
+// ---- PC Sampling helpers ----
+
+constexpr size_t PcSamplingBufferSize = 4 * 1024 * 1024; // 4 MB
+constexpr size_t PcSamplingWatermark = PcSamplingBufferSize / 2;
+constexpr uint64_t StochasticDefaultInterval = 131072; // 2^17 cycles
+
+PCSamplingMetric::PCSamplingMetricKind mapStochasticReason(
+    rocprofiler_pc_sampling_instruction_not_issued_reason_t reason,
+    bool waveIssued) {
+  using K = PCSamplingMetric::PCSamplingMetricKind;
+  if (waveIssued)
+    return K::StalledSelected;
+  switch (reason) {
+  case ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_NO_INSTRUCTION_AVAILABLE:
+    return K::StalledNoInstruction;
+  case ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_ALU_DEPENDENCY:
+    return K::StalledShortScoreboard;
+  case ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_WAITCNT:
+    return K::StalledLongScoreboard;
+  case ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_BARRIER_WAIT:
+    return K::StalledBarrier;
+  case ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_ARBITER_NOT_WIN:
+    return K::StalledNotSelected;
+  case ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_ARBITER_WIN_EX_STALL:
+    return K::StalledDispatchStall;
+  case ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_OTHER_WAIT:
+    return K::StalledWait;
+  case ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_SLEEP_WAIT:
+    return K::StalledSleeping;
+  case ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_INTERNAL_INSTRUCTION:
+  case ROCPROFILER_PC_SAMPLING_INSTRUCTION_NOT_ISSUED_REASON_NONE:
+  default:
+    return K::StalledMisc;
+  }
+}
+
+void pcSamplingBufferCallback(rocprofiler_context_id_t context,
+                              rocprofiler_buffer_id_t buffer,
+                              rocprofiler_record_header_t **headers,
+                              size_t numHeaders, void *userData,
+                              uint64_t dropCount);
+
+rocprofiler_status_t
+pcSamplingAgentQueryCallback(rocprofiler_agent_version_t version,
+                             const void **agents, size_t count,
+                             void *userData) {
+  auto *state = static_cast<RocprofilerRuntimeState *>(userData);
+  if (version != ROCPROFILER_AGENT_INFO_VERSION_0)
+    return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
+  auto agentList = reinterpret_cast<const rocprofiler_agent_t *const *>(agents);
+  for (size_t i = 0; i < count; ++i) {
+    const auto *agent = agentList[i];
+    if (agent->type != ROCPROFILER_AGENT_TYPE_GPU)
+      continue;
+
+    struct ConfigResult {
+      bool found = false;
+      rocprofiler_pc_sampling_configuration_t config{};
+    } result;
+
+    auto configCb = [](const rocprofiler_pc_sampling_configuration_t *configs,
+                       size_t numConfigs, void *ud) {
+      auto *res = static_cast<ConfigResult *>(ud);
+      for (size_t j = 0; j < numConfigs; ++j) {
+        if (configs[j].method == ROCPROFILER_PC_SAMPLING_METHOD_STOCHASTIC) {
+          res->config = configs[j];
+          res->found = true;
+          return ROCPROFILER_STATUS_SUCCESS;
+        }
+      }
+      return ROCPROFILER_STATUS_SUCCESS;
+    };
+
+    auto status = rocprofiler::queryPcSamplingAgentConfigurations<false>(
+        agent->id, configCb, &result);
+    if (status != ROCPROFILER_STATUS_SUCCESS || !result.found)
+      continue;
+
+    auto interval = StochasticDefaultInterval;
+    if (result.config.min_interval == result.config.max_interval)
+      interval = result.config.min_interval;
+
+    state->pcSamplingAgents.push_back(
+        {agent->id, result.config.method, result.config.unit, interval});
+  }
+  return ROCPROFILER_STATUS_SUCCESS;
 }
 
 // ROCTx marker interception via libroctx64.so's callback registration.
@@ -216,9 +322,12 @@ void processKernelRecord(
 
   --state.numNodes;
   if (state.numNodes == 0) {
-    corrIdToExternId.erase(record->correlation_id.internal);
-    corrIdToIsHipGraph.erase(record->correlation_id.internal);
-    externIdToState.erase(externId);
+    auto &rtState = getRuntimeState();
+    if (!rtState.pcSamplingStarted) {
+      corrIdToExternId.erase(record->correlation_id.internal);
+      corrIdToIsHipGraph.erase(record->correlation_id.internal);
+      externIdToState.erase(externId);
+    }
   }
 }
 
@@ -250,6 +359,10 @@ struct RocprofSDKProfiler::RocprofSDKProfilerPimpl
                                    rocprofiler_record_header_t **headers,
                                    size_t numHeaders, void *userData,
                                    uint64_t dropCount);
+  static void pcSamplingBufferCallbackImpl(
+      rocprofiler_context_id_t context, rocprofiler_buffer_id_t buffer,
+      rocprofiler_record_header_t **headers, size_t numHeaders, void *userData,
+      uint64_t dropCount);
 
   using KernelNameMap =
       ThreadSafeMap<uint64_t, std::string,
@@ -534,6 +647,68 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::kernelBufferCallback(
                            profiler.pendingGraphPool.get());
 }
 
+// ---- PC sampling buffer callback ----
+
+void RocprofSDKProfiler::RocprofSDKProfilerPimpl::pcSamplingBufferCallbackImpl(
+    rocprofiler_context_id_t /*context*/, rocprofiler_buffer_id_t /*buffer*/,
+    rocprofiler_record_header_t **headers, size_t numHeaders,
+    void * /*userData*/, uint64_t dropCount) {
+  auto &state = getRuntimeState();
+  auto &profiler = RocprofSDKProfiler::instance();
+  auto &correlation = profiler.correlation;
+
+  uint64_t sampleCount = 0;
+
+  for (size_t i = 0; i < numHeaders; ++i) {
+    auto *header = headers[i];
+    if (!header)
+      continue;
+    if (header->category != ROCPROFILER_BUFFER_CATEGORY_PC_SAMPLING)
+      continue;
+    if (header->kind != ROCPROFILER_PC_SAMPLING_RECORD_STOCHASTIC_V0_SAMPLE)
+      continue;
+
+    auto *rec = static_cast<rocprofiler_pc_sampling_record_stochastic_v0_t *>(
+        header->payload);
+    auto corrIdInternal = rec->correlation_id.internal;
+    auto reason =
+        static_cast<rocprofiler_pc_sampling_instruction_not_issued_reason_t>(
+            rec->snapshot.reason_not_issued);
+    bool waveIssued = rec->wave_issued != 0;
+    auto stallKind = mapStochasticReason(reason, waveIssued);
+    bool isStalled = !waveIssued;
+
+    ++sampleCount;
+
+    auto externId = Scope::DummyScopeId;
+    bool found = correlation.corrIdToExternId.withRead(
+        corrIdInternal, [&](const size_t &val) { externId = val; });
+    if (!found || externId == Scope::DummyScopeId)
+      continue;
+
+    uint64_t stalledSamples = isStalled ? 1 : 0;
+    correlation.externIdToState.withRead(externId, [&](const auto &extState) {
+      for (const auto &[data, entry] : extState.dataToEntry) {
+        entry.upsertMetric(std::make_unique<PCSamplingMetric>(
+            stallKind, /*samples=*/1, stalledSamples));
+      }
+    });
+  }
+
+  state.pcSampleCount.fetch_add(sampleCount, std::memory_order_relaxed);
+}
+
+namespace {
+void pcSamplingBufferCallback(rocprofiler_context_id_t context,
+                              rocprofiler_buffer_id_t buffer,
+                              rocprofiler_record_header_t **headers,
+                              size_t numHeaders, void *userData,
+                              uint64_t dropCount) {
+  RocprofSDKProfiler::RocprofSDKProfilerPimpl::pcSamplingBufferCallbackImpl(
+      context, buffer, headers, numHeaders, userData, dropCount);
+}
+} // namespace
+
 // ---- SDK tool init / fini (called by rocprofiler_force_configure) ----
 
 namespace {
@@ -632,6 +807,40 @@ int protonToolInit(rocprofiler_client_finalize_t finiFunc, void *toolData) {
 
   AgentIdMapper::instance().initialize();
 
+  rocprofiler::queryAvailableAgents<true>(ROCPROFILER_AGENT_INFO_VERSION_0,
+                                          &pcSamplingAgentQueryCallback,
+                                          sizeof(rocprofiler_agent_t), state);
+
+  if (!state->pcSamplingAgents.empty()) {
+    rocprofiler::createContext<true>(&state->pcSamplingContext);
+
+    rocprofiler::createCallbackThread<true>(&state->pcSamplingThread);
+
+    for (auto &agentInfo : state->pcSamplingAgents) {
+      rocprofiler_buffer_id_t bufId{};
+      rocprofiler::createBuffer<true>(
+          state->pcSamplingContext, PcSamplingBufferSize, PcSamplingWatermark,
+          ROCPROFILER_BUFFER_POLICY_LOSSLESS, &pcSamplingBufferCallback,
+          nullptr, &bufId);
+
+      rocprofiler::assignCallbackThread<true>(bufId, state->pcSamplingThread);
+
+      auto status = rocprofiler::configurePcSamplingService<false>(
+          state->pcSamplingContext, agentInfo.agentId, agentInfo.method,
+          agentInfo.unit, agentInfo.interval, bufId, 0);
+
+      if (status == ROCPROFILER_STATUS_SUCCESS) {
+        state->pcSamplingBuffers.push_back(bufId);
+      }
+    }
+
+    if (!state->pcSamplingBuffers.empty()) {
+      int pcValid = 0;
+      rocprofiler::contextIsValid<true>(state->pcSamplingContext, &pcValid);
+      state->pcSamplingConfigured = (pcValid != 0);
+    }
+  }
+
   state->configured = true;
   return 0;
 }
@@ -640,6 +849,10 @@ void protonToolFini(void *toolData) {
   auto *state = static_cast<RocprofilerRuntimeState *>(toolData);
   {
     std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->pcSamplingStarted) {
+      rocprofiler::stopContext<false>(state->pcSamplingContext);
+      state->pcSamplingStarted = false;
+    }
     if (state->profilingStarted) {
       rocprofiler::stopContext<false>(state->profilingContext);
       state->profilingStarted = false;
@@ -649,6 +862,8 @@ void protonToolFini(void *toolData) {
       state->codeObjectStarted = false;
     }
   }
+  for (auto bufId : state->pcSamplingBuffers)
+    rocprofiler::flushBuffer<false>(bufId);
   rocprofiler::flushBuffer<false>(state->kernelBuffer);
   if (state->finalizeFunc && state->clientId) {
     state->finalizeFunc(*state->clientId);
@@ -678,6 +893,11 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStart() {
     rocprofiler::startContext<true>(state.profilingContext);
     state.profilingStarted = true;
   }
+  if (profiler.pcSamplingEnabled && state.pcSamplingConfigured &&
+      !state.pcSamplingStarted) {
+    auto pcStatus = rocprofiler::startContext<false>(state.pcSamplingContext);
+    state.pcSamplingStarted = (pcStatus == ROCPROFILER_STATUS_SUCCESS);
+  }
   if (getBoolEnv("TRITON_ENABLE_NVTX", true))
     registerRoctxCallback(true);
 }
@@ -688,15 +908,31 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doFlush() {
   profiler.correlation.flush(
       /*maxRetries=*/100, /*sleepUs=*/10,
       [&state]() { rocprofiler::flushBuffer<true>(state.kernelBuffer); });
+  if (state.pcSamplingStarted) {
+    for (auto bufId : state.pcSamplingBuffers)
+      rocprofiler::flushBuffer<true>(bufId);
+  }
 }
 
 void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStop() {
   registerRoctxCallback(false);
   auto &state = getRuntimeState();
   std::lock_guard<std::mutex> lock(state.mutex);
+  bool wasPcSampling = state.pcSamplingStarted;
+  if (state.pcSamplingStarted) {
+    for (auto bufId : state.pcSamplingBuffers)
+      rocprofiler::flushBuffer<true>(bufId);
+    rocprofiler::stopContext<true>(state.pcSamplingContext);
+    state.pcSamplingStarted = false;
+    profiler.pcSamplingEnabled = false;
+  }
   if (state.profilingStarted) {
     rocprofiler::stopContext<true>(state.profilingContext);
     state.profilingStarted = false;
+  }
+  if (wasPcSampling) {
+    profiler.correlation.corrIdToExternId.clear();
+    profiler.correlation.externIdToState.clear();
   }
 }
 
@@ -718,7 +954,15 @@ RocprofSDKProfiler::~RocprofSDKProfiler() = default;
 void RocprofSDKProfiler::doSetMode(
     const std::vector<std::string> &modeAndOptions) {
   auto mode = modeAndOptions.empty() ? std::string() : modeAndOptions[0];
-  if (proton::toLower(mode) == "periodic_flushing") {
+  if (proton::toLower(mode) == "pcsampling") {
+    auto &state = getRuntimeState();
+    if (!state.pcSamplingConfigured) {
+      std::cerr << "[PROTON PC_SAMPLING] WARNING: PC sampling requested but "
+                   "no GPU agents support it on this system"
+                << std::endl;
+    }
+    pcSamplingEnabled = true;
+  } else if (proton::toLower(mode) == "periodic_flushing") {
     detail::setPeriodicFlushingMode(periodicFlushingEnabled,
                                     periodicFlushingFormat, modeAndOptions,
                                     "RocprofSDKProfiler");
