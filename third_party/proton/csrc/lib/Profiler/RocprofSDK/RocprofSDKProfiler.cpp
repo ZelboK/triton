@@ -79,8 +79,8 @@ RocprofilerRuntimeState &getRuntimeState() {
 
 // ---- PC Sampling helpers ----
 
-constexpr size_t PcSamplingBufferSize = 4 * 1024 * 1024; // 4 MB
-constexpr size_t PcSamplingWatermark = PcSamplingBufferSize / 2;
+constexpr size_t PcSamplingBufferSize = 16 * 1024 * 1024; // 16 MB
+constexpr size_t PcSamplingWatermark = PcSamplingBufferSize - 1024;
 constexpr uint64_t StochasticDefaultInterval = 131072; // 2^17 cycles
 
 PCSamplingMetric::PCSamplingMetricKind mapStochasticReason(
@@ -297,12 +297,13 @@ void processKernelRecord(
   auto &state = externIdToState[externId];
 
   if (!isGraph) {
-    for (auto [data, entry] : state.dataToEntry) {
+    for (auto &[data, entry] : state.dataToEntry) {
       if (auto metric = convertDispatchToMetric(record)) {
         if (state.isMissingName) {
           auto childEntry =
               data->addOp(entry.phase, entry.id, {Context(kernelName)});
           childEntry.upsertMetric(std::move(metric));
+          entry = childEntry;
         } else {
           entry.upsertMetric(std::move(metric));
         }
@@ -310,11 +311,12 @@ void processKernelRecord(
       }
     }
   } else {
-    for (auto [data, entry] : state.dataToEntry) {
+    for (auto &[data, entry] : state.dataToEntry) {
       if (auto metric = convertDispatchToMetric(record)) {
         auto childEntry =
             data->addOp(entry.phase, entry.id, {Context(kernelName)});
         childEntry.upsertMetric(std::move(metric));
+        entry = childEntry;
         detail::updateDataPhases(dataPhases, data, entry.phase);
       }
     }
