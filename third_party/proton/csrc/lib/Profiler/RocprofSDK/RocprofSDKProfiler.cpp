@@ -10,6 +10,7 @@
 #include "Utility/Map.h"
 #include "Utility/Singleton.h"
 
+#include "hip/amd_detail/hip_prof_str.h"
 #include "hip/hip_runtime_api.h"
 #include "rocprofiler-sdk/agent.h"
 #include "rocprofiler-sdk/buffer_tracing.h"
@@ -18,6 +19,7 @@
 #include "rocprofiler-sdk/hip/runtime_api_id.h"
 #include "rocprofiler-sdk/pc_sampling.h"
 #include "rocprofiler-sdk/registration.h"
+#include "roctracer/ext/prof_protocol.h"
 
 #include <atomic>
 #include <dlfcn.h>
@@ -41,6 +43,26 @@ namespace {
 
 constexpr size_t BufferSize = 64 * 1024 * 1024;
 constexpr const char *UnknownKernelName = "<unknown>";
+
+// Thread-local bridge for PC sampling: when rocprofiler-sdk's HIP callback
+// fires ENTER, it stores its correlation ID here. Then hipTracerPhaseEnter
+// (which runs inside the HIP call) maps it to the extern scope so PC samples
+// can look it up.
+static thread_local uint64_t tls_sdkCorrId = 0;
+
+// CLR-internal struct layout (not in public headers). Must match
+// projects/clr/hipamd/src/hip_prof_api.h exactly.
+struct HipApiTraceData {
+  hip_api_data_t apiData;
+  uint64_t phaseEnterTimestamp;
+  uint64_t phaseData;
+  void (*phaseEnter)(hip_api_id_t operationId, HipApiTraceData *data);
+  void (*phaseExit)(hip_api_id_t operationId, HipApiTraceData *data);
+};
+
+using HipRegisterTracerCallbackFn = void (*)(int (*)(activity_domain_t,
+                                                     uint32_t, void *));
+constexpr uint32_t kOpIdDispatch = 0;
 
 // ---- SDK runtime state (singleton, outlives any profiler instance) ----
 
@@ -70,6 +92,35 @@ struct RocprofilerRuntimeState {
   bool pcSamplingConfigured{false};
   bool pcSamplingStarted{false};
   std::atomic<uint64_t> pcSampleCount{0};
+
+  bool useHipTracer{false};
+  bool hipTracerRegistered{false};
+
+  // Time-based PC sampling correlation for late-attach mode.
+  // Stores completed dispatch time ranges so PC samples can be matched
+  // by timestamp when queue interception isn't available.
+  struct DispatchTimeRange {
+    uint64_t beginNs;
+    uint64_t endNs;
+    size_t externId;
+  };
+  std::mutex dispatchRangesMutex;
+  std::vector<DispatchTimeRange> dispatchRanges;
+
+  void addDispatchRange(uint64_t beginNs, uint64_t endNs, size_t externId) {
+    std::lock_guard<std::mutex> lock(dispatchRangesMutex);
+    dispatchRanges.push_back({beginNs, endNs, externId});
+  }
+
+  size_t findExternIdByTimestamp(uint64_t timestamp) const {
+    std::lock_guard<std::mutex> lock(
+        const_cast<std::mutex &>(dispatchRangesMutex));
+    for (auto it = dispatchRanges.rbegin(); it != dispatchRanges.rend(); ++it) {
+      if (timestamp >= it->beginNs && timestamp <= it->endNs)
+        return it->externId;
+    }
+    return Scope::DummyScopeId;
+  }
 };
 
 RocprofilerRuntimeState &getRuntimeState() {
@@ -366,6 +417,11 @@ struct RocprofSDKProfiler::RocprofSDKProfilerPimpl
       rocprofiler_record_header_t **headers, size_t numHeaders, void *userData,
       uint64_t dropCount);
 
+  static void hipTracerPhaseEnterImpl(hip_api_id_t opId, HipApiTraceData *data);
+  static void hipTracerPhaseExitImpl(hip_api_id_t opId, HipApiTraceData *data);
+  static int hipTracerCallbackImpl(activity_domain_t domain,
+                                   uint32_t operationId, void *data);
+
   using KernelNameMap =
       ThreadSafeMap<uint64_t, std::string,
                     std::unordered_map<uint64_t, std::string>>;
@@ -428,6 +484,16 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipRuntimeCallback(
       profiler.pImpl.get());
   auto *payload = static_cast<rocprofiler_callback_tracing_hip_api_data_t *>(
       record.payload);
+
+  // When hipTracer is active, this callback only serves as a PC sampling
+  // correlation bridge. Store rocprofiler-sdk's correlation ID at ENTER so
+  // hipTracerPhaseEnter can map it to the extern scope.
+  auto &rtState = getRuntimeState();
+  if (rtState.useHipTracer) {
+    if (record.phase == ROCPROFILER_CALLBACK_PHASE_ENTER && isKernelOp)
+      tls_sdkCorrId = record.correlation_id.internal;
+    return;
+  }
 
   if (record.phase == ROCPROFILER_CALLBACK_PHASE_ENTER) {
     if (!isKernelOp)
@@ -587,6 +653,194 @@ void registerRoctxCallback(bool enable) {
 }
 } // namespace
 
+// ---- HIP Tracer Callback (hipRegisterTracerCallback) ----
+// Provides dispatch timing for ALL queues, including pre-existing ones that
+// rocprofiler-sdk's buffer tracing cannot intercept in late-attach scenarios.
+
+namespace {
+
+std::atomic<uint64_t> hipTracerNextCorrId{1};
+
+bool isHipApiKernelLaunch(uint32_t op) {
+  switch (static_cast<hip_api_id_t>(op)) {
+  case HIP_API_ID_hipLaunchKernel:
+  case HIP_API_ID_hipExtLaunchKernel:
+  case HIP_API_ID_hipModuleLaunchKernel:
+  case HIP_API_ID_hipExtModuleLaunchKernel:
+  case HIP_API_ID_hipHccModuleLaunchKernel:
+  case HIP_API_ID_hipLaunchCooperativeKernel:
+  case HIP_API_ID_hipModuleLaunchCooperativeKernel:
+  case HIP_API_ID_hipExtLaunchMultiKernelMultiDevice:
+  case HIP_API_ID_hipLaunchCooperativeKernelMultiDevice:
+  case HIP_API_ID_hipModuleLaunchCooperativeKernelMultiDevice:
+  case HIP_API_ID_hipGraphLaunch:
+    return true;
+  default:
+    return false;
+  }
+}
+
+void hipTracerPhaseEnterFwd(hip_api_id_t opId, HipApiTraceData *data) {
+  RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipTracerPhaseEnterImpl(opId,
+                                                                       data);
+}
+
+void hipTracerPhaseExitFwd(hip_api_id_t opId, HipApiTraceData *data) {
+  RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipTracerPhaseExitImpl(opId,
+                                                                      data);
+}
+
+int hipTracerCallbackFwd(activity_domain_t domain, uint32_t operationId,
+                         void *data) {
+  return RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipTracerCallbackImpl(
+      domain, operationId, data);
+}
+
+void registerHipTracerCallback(bool enable) {
+  void *hipLib = dlopen("libamdhip64.so", RTLD_NOLOAD | RTLD_NOW);
+  if (!hipLib)
+    return;
+  auto *fn = reinterpret_cast<HipRegisterTracerCallbackFn>(
+      dlsym(hipLib, "hipRegisterTracerCallback"));
+  dlclose(hipLib);
+  if (!fn)
+    return;
+  fn(enable ? &hipTracerCallbackFwd : nullptr);
+}
+
+bool isHipTracerAvailable() {
+  void *hipLib = dlopen("libamdhip64.so", RTLD_NOLOAD | RTLD_NOW);
+  if (!hipLib)
+    return false;
+  auto *fn = dlsym(hipLib, "hipRegisterTracerCallback");
+  dlclose(hipLib);
+  return fn != nullptr;
+}
+
+} // namespace
+
+// ---- HIP Tracer Callback static member implementations ----
+
+void RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipTracerPhaseEnterImpl(
+    hip_api_id_t opId, HipApiTraceData *data) {
+  if (!isHipApiKernelLaunch(static_cast<uint32_t>(opId)))
+    return;
+
+  auto &profiler = RocprofSDKProfiler::instance();
+  auto &ts = GPUProfiler<RocprofSDKProfiler>::threadState;
+  ts.enterOp(Scope(""));
+  auto &dataToEntry = ts.dataToEntry;
+  auto &scope = ts.scopeStack.back();
+  profiler.correlation.correlate(data->apiData.correlation_id, scope.scopeId,
+                                 /*numNodes=*/1, scope.name.empty(),
+                                 dataToEntry);
+
+  // PC sampling bridge: map rocprofiler-sdk's correlation ID (stored earlier
+  // by hipRuntimeCallback ENTER) to the same extern scope so PC samples can
+  // find it. The SDK's ID space is separate from CLR's correlation IDs.
+  auto &rtState = getRuntimeState();
+  if (rtState.pcSamplingStarted && tls_sdkCorrId != 0) {
+    profiler.correlation.corrIdToExternId.insert(tls_sdkCorrId, scope.scopeId);
+    tls_sdkCorrId = 0;
+  }
+}
+
+void RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipTracerPhaseExitImpl(
+    hip_api_id_t opId, HipApiTraceData *data) {
+  if (!isHipApiKernelLaunch(static_cast<uint32_t>(opId)))
+    return;
+
+  auto &profiler = RocprofSDKProfiler::instance();
+  auto &ts = GPUProfiler<RocprofSDKProfiler>::threadState;
+  ts.exitOp();
+  profiler.correlation.submit(data->apiData.correlation_id);
+}
+
+int RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipTracerCallbackImpl(
+    activity_domain_t domain, uint32_t operationId, void *data) {
+  if (domain == ACTIVITY_DOMAIN_HIP_OPS) {
+    if (data == nullptr)
+      return (operationId == kOpIdDispatch) ? 0 : -1;
+
+    auto *record = static_cast<activity_record_t *>(data);
+    if (record->begin_ns >= record->end_ns)
+      return 0;
+
+    auto &profiler = RocprofSDKProfiler::instance();
+    auto &correlation = profiler.correlation;
+
+    auto externId = Scope::DummyScopeId;
+    bool found = correlation.corrIdToExternId.withRead(
+        record->correlation_id, [&](const size_t &value) { externId = value; });
+    if (!found || externId == Scope::DummyScopeId)
+      return 0;
+
+    std::string kernelName =
+        record->kernel_name ? record->kernel_name : UnknownKernelName;
+    const std::string suffix = ".kd";
+    if (kernelName.size() > suffix.size() &&
+        kernelName.compare(kernelName.size() - suffix.size(), suffix.size(),
+                           suffix) == 0)
+      kernelName.resize(kernelName.size() - suffix.size());
+
+    auto deviceId = static_cast<uint64_t>(record->device_id);
+
+    // Store time range for time-based PC sampling correlation in late-attach
+    auto &rtState = getRuntimeState();
+    if (rtState.pcSamplingStarted && record->begin_ns < record->end_ns)
+      rtState.addDispatchRange(record->begin_ns, record->end_ns, externId);
+
+    static thread_local std::map<Data *, std::pair<size_t, size_t>> dataPhases;
+    dataPhases.clear();
+
+    auto &state = correlation.externIdToState[externId];
+    for (auto &[dataPtr, entry] : state.dataToEntry) {
+      auto metric = std::make_unique<KernelMetric>(
+          static_cast<uint64_t>(record->begin_ns),
+          static_cast<uint64_t>(record->end_ns), /*count=*/1, deviceId,
+          static_cast<uint64_t>(DeviceType::HIP), record->queue_id);
+      if (state.isMissingName) {
+        auto childEntry =
+            dataPtr->addOp(entry.phase, entry.id, {Context(kernelName)});
+        childEntry.upsertMetric(std::move(metric));
+        entry = childEntry;
+      } else {
+        entry.upsertMetric(std::move(metric));
+      }
+      detail::updateDataPhases(dataPhases, dataPtr, entry.phase);
+    }
+
+    --state.numNodes;
+    if (state.numNodes == 0) {
+      auto &rtState = getRuntimeState();
+      if (!rtState.pcSamplingStarted) {
+        correlation.corrIdToExternId.erase(record->correlation_id);
+        correlation.externIdToState.erase(externId);
+      }
+    }
+    correlation.complete(record->correlation_id);
+
+    static thread_local std::map<Data *, size_t> dataFlushedPhases;
+    profiler.flushDataPhases(dataFlushedPhases, dataPhases,
+                             profiler.pendingGraphPool.get());
+    return 0;
+  }
+
+  if (domain == ACTIVITY_DOMAIN_HIP_API) {
+    if (!isHipApiKernelLaunch(operationId))
+      return -1;
+
+    auto *trace = static_cast<HipApiTraceData *>(data);
+    trace->apiData.correlation_id =
+        hipTracerNextCorrId.fetch_add(1, std::memory_order_relaxed);
+    trace->phaseEnter = &hipTracerPhaseEnterFwd;
+    trace->phaseExit = &hipTracerPhaseExitFwd;
+    return 0;
+  }
+
+  return -1;
+}
+
 // ---- Code object callback (kernel_id -> name mapping) ----
 
 void RocprofSDKProfiler::RocprofSDKProfilerPimpl::codeObjectCallback(
@@ -613,6 +867,12 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::kernelBufferCallback(
     rocprofiler_context_id_t context, rocprofiler_buffer_id_t buffer,
     rocprofiler_record_header_t **headers, size_t numHeaders, void *userData,
     uint64_t dropCount) {
+  // When hipTracer is active, buffer tracing exists only for PC sampling
+  // dispatch correlation. hipTracer handles timing; just consume the buffer.
+  auto &rtState = getRuntimeState();
+  if (rtState.useHipTracer)
+    return;
+
   if (dropCount > 0) {
     std::cerr << "[PROTON] ROCProfiler-SDK dropped " << dropCount
               << " kernel dispatch records" << std::endl;
@@ -667,25 +927,59 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::pcSamplingBufferCallbackImpl(
       continue;
     if (header->category != ROCPROFILER_BUFFER_CATEGORY_PC_SAMPLING)
       continue;
-    if (header->kind != ROCPROFILER_PC_SAMPLING_RECORD_STOCHASTIC_V0_SAMPLE)
+
+    // Accept both stochastic and host-trap sample records
+    bool isStochastic =
+        (header->kind == ROCPROFILER_PC_SAMPLING_RECORD_STOCHASTIC_V0_SAMPLE);
+    bool isHostTrap =
+        (header->kind == ROCPROFILER_PC_SAMPLING_RECORD_HOST_TRAP_V0_SAMPLE);
+    if (!isStochastic && !isHostTrap)
       continue;
 
-    auto *rec = static_cast<rocprofiler_pc_sampling_record_stochastic_v0_t *>(
-        header->payload);
-    auto corrIdInternal = rec->correlation_id.internal;
-    auto reason =
-        static_cast<rocprofiler_pc_sampling_instruction_not_issued_reason_t>(
-            rec->snapshot.reason_not_issued);
-    bool waveIssued = rec->wave_issued != 0;
+    uint64_t corrIdInternal = 0;
+    rocprofiler_pc_sampling_instruction_not_issued_reason_t reason{};
+    bool waveIssued = false;
+
+    if (isStochastic) {
+      auto *rec = static_cast<rocprofiler_pc_sampling_record_stochastic_v0_t *>(
+          header->payload);
+      corrIdInternal = rec->correlation_id.internal;
+      reason =
+          static_cast<rocprofiler_pc_sampling_instruction_not_issued_reason_t>(
+              rec->snapshot.reason_not_issued);
+      waveIssued = rec->wave_issued != 0;
+    } else {
+      auto *rec = static_cast<rocprofiler_pc_sampling_record_host_trap_v0_t *>(
+          header->payload);
+      corrIdInternal = rec->correlation_id.internal;
+      waveIssued = true;
+    }
     auto stallKind = mapStochasticReason(reason, waveIssued);
     bool isStalled = !waveIssued;
 
     ++sampleCount;
 
+    // Extract timestamp for time-based fallback correlation
+    uint64_t sampleTimestamp = 0;
+    if (isStochastic) {
+      auto *recTs =
+          static_cast<rocprofiler_pc_sampling_record_stochastic_v0_t *>(
+              header->payload);
+      sampleTimestamp = recTs->timestamp;
+    }
+
     auto externId = Scope::DummyScopeId;
-    bool found = correlation.corrIdToExternId.withRead(
-        corrIdInternal, [&](const size_t &val) { externId = val; });
-    if (!found || externId == Scope::DummyScopeId)
+    if (corrIdInternal != 0) {
+      // Primary path: correlate via rocprofiler-sdk correlation ID
+      correlation.corrIdToExternId.withRead(
+          corrIdInternal, [&](const size_t &val) { externId = val; });
+    }
+    if (externId == Scope::DummyScopeId && sampleTimestamp != 0) {
+      // Fallback: time-based correlation (needed for late-attach where
+      // queue interception doesn't produce dispatch marker packets)
+      externId = state.findExternIdByTimestamp(sampleTimestamp);
+    }
+    if (externId == Scope::DummyScopeId)
       continue;
 
     uint64_t stalledSamples = isStalled ? 1 : 0;
@@ -741,19 +1035,18 @@ int protonToolInit(rocprofiler_client_finalize_t finiFunc, void *toolData) {
   rocprofiler::startContext<true>(state->codeObjectContext);
   state->codeObjectStarted = true;
 
+  // Detect hipRegisterTracerCallback availability. When available, use it
+  // instead of rocprofiler-sdk HIP callback/buffer tracing. This captures
+  // dispatches on ALL queues including pre-existing ones.
+  state->useHipTracer = isHipTracerAvailable();
+
   // Context 2: on-demand profiling context for HIP callback tracing and
-  // kernel dispatch buffer tracing. Started/stopped in doStart()/doStop().
-  // Registering BUFFER_TRACING_KERNEL_DISPATCH here causes
-  // enable_queue_intercept() to install HSA queue hooks at force_configure
-  // time, even though the context is not yet active.
+  // kernel dispatch buffer tracing. Always configured regardless of hipTracer
+  // mode -- in hipTracer mode, the context is only started when PC sampling
+  // is requested (providing dispatch interception for PC sample correlation).
   rocprofiler::createContext<true>(&state->profilingContext);
 
-  // Subscribe only to the HIP operations Proton needs: kernel launches,
-  // graph capture/instantiate/destroy. Passing nullptr/0 would subscribe to
-  // all ~519 HIP runtime APIs, causing the SDK to construct correlation IDs
-  // and invoke our callback for every hipMalloc, hipMemcpy, etc.
   constexpr rocprofiler_tracing_operation_t kTracedHipOps[] = {
-      // Kernel launches (ENTER: correlation tracking, EXIT: capture counting)
       ROCPROFILER_HIP_RUNTIME_API_ID_hipLaunchKernel,
       ROCPROFILER_HIP_RUNTIME_API_ID_hipExtLaunchKernel,
       ROCPROFILER_HIP_RUNTIME_API_ID_hipExtLaunchMultiKernelMultiDevice,
@@ -765,13 +1058,10 @@ int protonToolInit(rocprofiler_client_finalize_t finiFunc, void *toolData) {
       ROCPROFILER_HIP_RUNTIME_API_ID_hipModuleLaunchCooperativeKernel,
       ROCPROFILER_HIP_RUNTIME_API_ID_hipModuleLaunchCooperativeKernelMultiDevice,
       ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphLaunch,
-      // Graph capture (EXIT only)
       ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamBeginCapture,
       ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamEndCapture,
-      // Graph instantiate (EXIT only)
       ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphInstantiate,
       ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphInstantiateWithFlags,
-      // Graph cleanup (EXIT only)
       ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphExecDestroy,
       ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphDestroy,
   };
@@ -781,11 +1071,6 @@ int protonToolInit(rocprofiler_client_finalize_t finiFunc, void *toolData) {
       kTracedHipOps, std::size(kTracedHipOps),
       &RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipRuntimeCallback,
       nullptr);
-
-  // Marker tracing (ROCTx) is handled via direct roctxRegisterTracerCallback
-  // in doStart()/doStop(), since rocprofiler-sdk's marker callback tracing
-  // requires its replacement roctx library which isn't available with
-  // late-start (force_configure).
 
   size_t watermark = BufferSize - (BufferSize / 8);
   rocprofiler::createBuffer<true>(
@@ -867,6 +1152,10 @@ void protonToolFini(void *toolData) {
   for (auto bufId : state->pcSamplingBuffers)
     rocprofiler::flushBuffer<false>(bufId);
   rocprofiler::flushBuffer<false>(state->kernelBuffer);
+  if (state->hipTracerRegistered) {
+    registerHipTracerCallback(false);
+    state->hipTracerRegistered = false;
+  }
   if (state->finalizeFunc && state->clientId) {
     state->finalizeFunc(*state->clientId);
   }
@@ -891,9 +1180,24 @@ protonConfigure(uint32_t version, const char *runtimeVersion, uint32_t priority,
 void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStart() {
   auto &state = getRuntimeState();
   std::lock_guard<std::mutex> lock(state.mutex);
-  if (!state.profilingStarted) {
-    rocprofiler::startContext<true>(state.profilingContext);
-    state.profilingStarted = true;
+  if (state.useHipTracer) {
+    if (!state.hipTracerRegistered) {
+      registerHipTracerCallback(true);
+      state.hipTracerRegistered = true;
+    }
+    // When PC sampling is requested, also start the profilingContext so
+    // rocprofiler-sdk intercepts dispatches and assigns correlation IDs
+    // that PC samples can reference.
+    if (profiler.pcSamplingEnabled && state.pcSamplingConfigured &&
+        !state.profilingStarted) {
+      rocprofiler::startContext<true>(state.profilingContext);
+      state.profilingStarted = true;
+    }
+  } else {
+    if (!state.profilingStarted) {
+      rocprofiler::startContext<true>(state.profilingContext);
+      state.profilingStarted = true;
+    }
   }
   if (profiler.pcSamplingEnabled && state.pcSamplingConfigured &&
       !state.pcSamplingStarted) {
@@ -907,9 +1211,18 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStart() {
 void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doFlush() {
   auto &state = getRuntimeState();
   std::ignore = hip::deviceSynchronize<true>();
-  profiler.correlation.flush(
-      /*maxRetries=*/100, /*sleepUs=*/10,
-      [&state]() { rocprofiler::flushBuffer<true>(state.kernelBuffer); });
+  if (state.useHipTracer) {
+    profiler.correlation.flush(/*maxRetries=*/100, /*sleepUs=*/10, [&state]() {
+      // If profilingContext is started (for PC sampling bridge), consume
+      // its kernel buffer to prevent overflow.
+      if (state.profilingStarted)
+        rocprofiler::flushBuffer<true>(state.kernelBuffer);
+    });
+  } else {
+    profiler.correlation.flush(
+        /*maxRetries=*/100, /*sleepUs=*/10,
+        [&state]() { rocprofiler::flushBuffer<true>(state.kernelBuffer); });
+  }
   if (state.pcSamplingStarted) {
     for (auto bufId : state.pcSamplingBuffers)
       rocprofiler::flushBuffer<true>(bufId);
@@ -928,6 +1241,12 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStop() {
     state.pcSamplingStarted = false;
     profiler.pcSamplingEnabled = false;
   }
+  if (state.useHipTracer && state.hipTracerRegistered) {
+    registerHipTracerCallback(false);
+    state.hipTracerRegistered = false;
+  }
+  // profilingContext may be started in both hipTracer (for PC sampling bridge)
+  // and non-hipTracer modes.
   if (state.profilingStarted) {
     rocprofiler::stopContext<true>(state.profilingContext);
     state.profilingStarted = false;
@@ -935,6 +1254,8 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStop() {
   if (wasPcSampling) {
     profiler.correlation.corrIdToExternId.clear();
     profiler.correlation.externIdToState.clear();
+    std::lock_guard<std::mutex> rangeLock(state.dispatchRangesMutex);
+    state.dispatchRanges.clear();
   }
 }
 
