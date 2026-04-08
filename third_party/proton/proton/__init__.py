@@ -12,10 +12,11 @@ from .profile import (
 from . import context, specs, mode, data
 
 
-# Eagerly configure rocprofiler-sdk on AMD systems so that the interception
-# hooks are installed before any HIP/HSA operations create GPU queues.
-# force_configure must run before the first HSA queue is created, otherwise
-# buffer tracing (kernel dispatch timing) cannot intercept those queues.
+# Eagerly configure rocprofiler-sdk on AMD systems.  When the firmware
+# dispatch ring is available, queue interception is not needed and
+# force_configure can happen at any time (late-attach is supported).
+# When the firmware ring is NOT available, force_configure must run before
+# the first HSA queue is created so the SDK can intercept hsa_queue_create.
 def _eager_rocprofiler_init():
     try:
         from triton.backends import backends

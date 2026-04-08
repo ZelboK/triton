@@ -20,6 +20,7 @@
 #include "rocprofiler-sdk/registration.h"
 
 #include <atomic>
+#include <deque>
 #include <dlfcn.h>
 #include <iostream>
 #include <limits>
@@ -420,6 +421,19 @@ struct RocprofSDKProfiler::RocprofSDKProfilerPimpl
   std::atomic<int> activeCaptureCount{0};
 
   KernelNameMap kernelNames;
+
+  // Firmware ring buffer fallback: when the SDK uses the firmware dispatch
+  // ring instead of queue interception, buffer records carry drainer-generated
+  // correlation IDs that don't match HIP callback correlation IDs.  We
+  // maintain a FIFO of submitted kernel scopes so that buffer records without
+  // a matching HIP correlation can be matched in submission order.
+  struct PendingLaunch {
+    size_t externId;
+    DataToEntryMap dataToEntry;
+    bool isMissingName;
+  };
+  std::mutex pendingLaunchMutex;
+  std::deque<PendingLaunch> pendingLaunches;
 };
 
 // ---- HIP Runtime API callback (correlation tracking) ----
@@ -558,6 +572,21 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::hipRuntimeCallback(
   }
 
   if (isKernelOp) {
+    // Push scope info for firmware-ring fallback matching before exitOp
+    // clears the thread-local state.
+    auto externId = Scope::DummyScopeId;
+    profiler.correlation.corrIdToExternId.withRead(
+        record.correlation_id.internal,
+        [&](const size_t &value) { externId = value; });
+    if (externId != Scope::DummyScopeId) {
+      profiler.correlation.externIdToState.withRead(
+          externId, [&](const auto &state) {
+            std::lock_guard<std::mutex> lk(impl->pendingLaunchMutex);
+            impl->pendingLaunches.push_back(
+                {externId, state.dataToEntry, state.isMissingName});
+          });
+    }
+
     threadState.exitOp();
     profiler.correlation.submit(record.correlation_id.internal);
   }
@@ -639,18 +668,58 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::kernelBufferCallback(
   for (size_t i = 0; i < numHeaders; ++i) {
     auto *header = headers[i];
     if (header->category != ROCPROFILER_BUFFER_CATEGORY_TRACING ||
-        header->kind != ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH) {
+        header->kind != ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH)
       continue;
-    }
+
     auto *record =
         static_cast<rocprofiler_buffer_tracing_kernel_dispatch_record_t *>(
             header->payload);
     maxCorrelationId =
         std::max(maxCorrelationId, record->correlation_id.internal);
     auto kernelName = impl->getKernelName(record->dispatch_info.kernel_id);
-    processKernelRecord(profiler, correlation.corrIdToExternId,
-                        correlation.externIdToState, impl->corrIdToIsHipGraph,
-                        dataPhases, kernelName, record);
+
+    auto externId = Scope::DummyScopeId;
+    bool hasCorrelation = correlation.corrIdToExternId.withRead(
+        record->correlation_id.internal,
+        [&](const size_t &value) { externId = value; });
+
+    if (hasCorrelation && externId != Scope::DummyScopeId) {
+      processKernelRecord(profiler, correlation.corrIdToExternId,
+                          correlation.externIdToState, impl->corrIdToIsHipGraph,
+                          dataPhases, kernelName, record);
+    } else {
+      // Firmware ring fallback: the drainer generated a new correlation ID
+      // that doesn't match any HIP callback.  Match by submission order.
+      PendingLaunch pending;
+      bool hasPending = false;
+      {
+        std::lock_guard<std::mutex> lk(impl->pendingLaunchMutex);
+        if (!impl->pendingLaunches.empty()) {
+          pending = impl->pendingLaunches.front();
+          impl->pendingLaunches.pop_front();
+          hasPending = true;
+        }
+      }
+      if (hasPending && pending.externId != Scope::DummyScopeId) {
+        if (record->start_timestamp < record->end_timestamp) {
+          auto metric = convertDispatchToMetric(record);
+          if (metric) {
+            for (auto &[data, entry] : pending.dataToEntry) {
+              if (pending.isMissingName) {
+                auto childEntry = data->addOp(entry.phase, entry.id,
+                                              {Context(kernelName)});
+                childEntry.upsertMetric(std::move(metric));
+                metric = convertDispatchToMetric(record);
+              } else {
+                entry.upsertMetric(std::move(metric));
+                metric = convertDispatchToMetric(record);
+              }
+              detail::updateDataPhases(dataPhases, data, entry.phase);
+            }
+          }
+        }
+      }
+    }
   }
   if (maxCorrelationId > 0) {
     correlation.complete(maxCorrelationId);
@@ -750,9 +819,10 @@ int proton_tool_init(rocprofiler_client_finalize_t finiFunc, void *toolData) {
 
   // Context 2: on-demand profiling context for HIP callback tracing and
   // kernel dispatch buffer tracing. Started/stopped in doStart()/doStop().
-  // Registering BUFFER_TRACING_KERNEL_DISPATCH here causes
-  // enable_queue_intercept() to install HSA queue hooks at force_configure
-  // time, even though the context is not yet active.
+  // When the firmware dispatch ring is available, registering
+  // BUFFER_TRACING_KERNEL_DISPATCH causes the SDK to start the firmware
+  // ring drainer (no queue interception needed).  Otherwise, the SDK
+  // installs HSA queue hooks via enable_queue_intercept().
   rocprofiler::createContext<true>(&state->profilingContext);
 
   // Subscribe only to the HIP operations Proton needs: kernel launches,
@@ -917,8 +987,17 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStart() {
 void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doFlush() {
   auto &state = getRuntimeState();
   std::ignore = hip::deviceSynchronize<true>();
+  // With the firmware dispatch ring, records arrive asynchronously via
+  // the drainer thread.  Flush several times with small delays so the
+  // drainer has time to deliver all records before we give up.
+  for (int i = 0; i < 5; ++i) {
+    rocprofiler::flushBuffer<true>(state.kernelBuffer);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  // Also run the standard correlation-based flush loop in case queue
+  // interception is active (non-firmware path).
   profiler.correlation.flush(
-      /*maxRetries=*/100, /*sleepUs=*/10,
+      /*maxRetries=*/10, /*sleepUs=*/10,
       [&state]() { rocprofiler::flushBuffer<true>(state.kernelBuffer); });
   if (state.pcSamplingStarted) {
     for (auto bufId : state.pcSamplingBuffers)
@@ -948,6 +1027,11 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStop() {
   if (wasPcSampling) {
     profiler.correlation.corrIdToExternId.clear();
     profiler.correlation.externIdToState.clear();
+  }
+  // Clear the firmware-ring fallback queue.
+  {
+    std::lock_guard<std::mutex> lk(pendingLaunchMutex);
+    pendingLaunches.clear();
   }
 }
 

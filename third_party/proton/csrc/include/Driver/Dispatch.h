@@ -95,19 +95,21 @@ public:
 
   static void init(const char *name, void **lib) {
     if (*lib == nullptr) {
-      // If not found, try to load it from the default path
-      auto dir =
-          ExternLib::pathEnv == nullptr ? "" : getStrEnv(ExternLib::pathEnv);
-      if (!dir.empty()) {
-        auto fullPath = dir + "/" + name;
-        *lib = dlopen(fullPath.c_str(), RTLD_LOCAL | RTLD_LAZY);
-      } else {
-        // Only if the default path is not set, we try to load it from the
-        // system.
-        // First reuse the existing handle
-        *lib = dlopen(name, RTLD_NOLOAD);
-        if (*lib == nullptr) {
-          // If not found, try to load it from LD_LIBRARY_PATH
+      // Always try to reuse an already-loaded handle first.  This is
+      // critical for libraries like librocprofiler-sdk.so that maintain
+      // internal singleton state (buffers, drainer threads, contexts):
+      // opening a second copy with RTLD_LOCAL would create a separate set
+      // of globals and break buffer tracing.
+      *lib = dlopen(name, RTLD_NOLOAD | RTLD_LAZY);
+      if (*lib == nullptr) {
+        auto dir =
+            ExternLib::pathEnv == nullptr ? "" : getStrEnv(ExternLib::pathEnv);
+        if (!dir.empty()) {
+          auto fullPath = dir + "/" + name;
+          *lib = dlopen(fullPath.c_str(), RTLD_NOLOAD | RTLD_LAZY);
+          if (*lib == nullptr)
+            *lib = dlopen(fullPath.c_str(), RTLD_LOCAL | RTLD_LAZY);
+        } else {
           *lib = dlopen(name, RTLD_LOCAL | RTLD_LAZY);
         }
       }
