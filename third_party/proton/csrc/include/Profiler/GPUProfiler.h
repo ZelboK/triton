@@ -104,6 +104,7 @@ protected:
   virtual void doStart() override { pImpl->doStart(); }
   virtual void doFlush() override { pImpl->doFlush(); }
   virtual void doStop() override { pImpl->doStop(); }
+  void doReleaseData(Data *data) override { correlation.unregisterData(data); }
   virtual void addMetrics(
       size_t scopeId,
       const std::map<std::string, MetricValueType> &scalarMetrics,
@@ -202,6 +203,13 @@ protected:
       externIdToState.clear();
       maxCompletedCorrelationId.store(0);
       maxSubmittedCorrelationId.store(0);
+    }
+
+    void unregisterData(Data *data) {
+      externIdToState.forEachWrite([data](size_t, ExternIdState &state) {
+        state.dataToEntry.erase(data);
+        state.dataToGraphEntry.erase(data);
+      });
     }
   };
 

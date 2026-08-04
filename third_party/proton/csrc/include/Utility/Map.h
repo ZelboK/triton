@@ -83,6 +83,12 @@ public:
     map.clear();
   }
 
+  template <typename FnT> void forEachWrite(FnT &&fn) {
+    std::unique_lock<std::shared_mutex> lock(mutex);
+    for (auto &[key, value] : map)
+      fn(key, value);
+  }
+
   size_t size() const {
     std::shared_lock<std::shared_mutex> lock(mutex);
     return map.size();

@@ -18,6 +18,7 @@ private:
   int64_t timestampOffsetNs{};
   bool isTimestampCalibrated{false};
 
+  void doReleaseData(Data *data) override;
   virtual void
   doSetMode(const std::vector<std::string> &modeAndOptions) override;
 };

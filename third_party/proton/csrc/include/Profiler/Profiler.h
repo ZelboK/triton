@@ -82,6 +82,8 @@ public:
     return this;
   }
 
+  void releaseData(Data *data) { this->doReleaseData(data); }
+
   /// Get the set of data objects registered to the profiler.
   std::set<Data *> getDataSet() const { return dataSet; }
 
@@ -106,6 +108,7 @@ protected:
   virtual void doStart() = 0;
   virtual void doFlush() = 0;
   virtual void doStop() = 0;
+  virtual void doReleaseData(Data *) {}
   virtual void doSetMode(const std::vector<std::string> &modeAndOptions) = 0;
 
   std::set<Data *> dataSet;

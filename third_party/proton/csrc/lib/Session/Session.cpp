@@ -192,6 +192,7 @@ void SessionManager::removeSession(size_t sessionId) {
   // session0 should be aware of scope "A"'s enter and exit, otherwise the
   // context stack will be imbalanced.
   sessions[sessionId]->contextSource->clear();
+  sessions[sessionId]->profiler->releaseData(sessions[sessionId]->data.get());
   auto path = sessions[sessionId]->path;
   sessionPaths.erase(path);
   sessionActive.erase(sessionId);

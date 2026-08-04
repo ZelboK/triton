@@ -40,6 +40,63 @@ proton.finalize(session)
     assert result.returncode == 0, result.stderr
 
 
+def test_rocprofiler_late_dispatch_after_session_destroy(tmp_path: pathlib.Path):
+    script = """
+import json
+import pathlib
+import sys
+
+import torch
+
+if torch.version.hip is None:
+    raise SystemExit(77)
+
+import triton.profiler as proton
+
+profile0 = pathlib.Path(sys.argv[1])
+profile1 = pathlib.Path(sys.argv[2])
+
+session0 = proton.start(str(profile0.with_suffix("")), backend="rocprofiler")
+session1 = proton.start(str(profile1.with_suffix("")), backend="rocprofiler")
+with proton.scope("first_session"):
+    torch.ones((16,), device="cuda")
+proton.finalize(session0)
+
+with proton.scope("second_session"):
+    torch.ones((16,), device="cuda")
+proton.finalize(session1)
+
+with profile1.open() as f:
+    data = json.load(f)
+assert [child["frame"]["name"] for child in data[0]["children"]] == [
+    "first_session",
+    "second_session",
+]
+"""
+    env = os.environ.copy()
+    env.pop("HIP_VISIBLE_DEVICES", None)
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    env.pop("ROCPROFILER_REGISTER_FORCE_LOAD", None)
+    env.pop("ROCPROFILER_REGISTER_LIBRARY", None)
+    env["PROTON_TEST_DEFER_FIRST_ROCPROFILER_DISPATCH"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path / "late_dispatch_0.hatchet"),
+            str(tmp_path / "late_dispatch_1.hatchet"),
+        ],
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode == 77:
+        pytest.skip("Requires a HIP PyTorch build")
+    assert result.returncode == 0, (f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+
+
 @pytest.mark.parametrize("mode", ["script", "python", "pytest"])
 def test_exec(mode, tmp_path: pathlib.Path):
     file_path = __file__

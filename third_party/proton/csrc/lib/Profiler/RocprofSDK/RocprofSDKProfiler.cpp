@@ -633,6 +633,12 @@ void processGraphKernelRecord(
 
 struct RocprofSDKProfiler::RocprofSDKProfilerPimpl
     : public GPUProfiler<RocprofSDKProfiler>::GPUProfilerPimplInterface {
+  struct DeferredDispatch {
+    rocprofiler_buffer_tracing_kernel_dispatch_record_t record;
+    std::string kernelName;
+    uint64_t streamId;
+  };
+
   RocprofSDKProfilerPimpl(RocprofSDKProfiler &profiler)
       : GPUProfiler<RocprofSDKProfiler>::GPUProfilerPimplInterface(profiler) {
     auto runtime = &HipRuntime::instance();
@@ -717,6 +723,13 @@ struct RocprofSDKProfiler::RocprofSDKProfilerPimpl
   // maps multiple HIP streams to the same underlying HSA queue.
   ThreadSafeMap<uint64_t, uint64_t, std::unordered_map<uint64_t, uint64_t>>
       corrIdToStreamId;
+  // Unlike the generic correlation high-water marks, this set preserves gaps
+  // when rocprofiler-sdk delivers dispatch records out of order.
+  ThreadSafeMap<uint64_t, bool, std::unordered_map<uint64_t, bool>>
+      pendingDispatches;
+  // Test-only delayed delivery used by the subprocess lifetime regression.
+  std::optional<DeferredDispatch> deferredDispatch;
+  bool deferredDispatchInjected{false};
 
   KernelPhaseTracker kernelPhaseTracker;
 
@@ -743,7 +756,31 @@ struct RocprofSDKProfiler::RocprofSDKProfilerPimpl
   // ROCPROFILER_CALLBACK_TRACING_HIP_GRAPH.
   ThreadSafeMap<uint64_t, GraphState> graphStates;
 #endif
+
+  void releaseData(Data *data);
 };
+
+namespace {
+void releaseGraphData(GraphState &state, Data *data) {
+  state.dataToEntryIdToNodeStates.erase(data);
+  for (auto &[nodeId, nodeState] : state.nodeIdToState)
+    nodeState.dataToEntryId.erase(data);
+  for (auto &[nodeId, metricState] : state.metricNodeIdToState)
+    metricState.dataToEntryId.erase(data);
+}
+} // namespace
+
+void RocprofSDKProfiler::RocprofSDKProfilerPimpl::releaseData(Data *data) {
+#if PROTON_ROCPROFILER_SDK_HAS_HIP_GRAPH
+  graphToState.forEachWrite(
+      [data](hipGraph_t, GraphState &state) { releaseGraphData(state, data); });
+  graphStates.forEachWrite(
+      [data](uint64_t, GraphState &state) { releaseGraphData(state, data); });
+  releaseGraphData(streamCaptureGraphState, data);
+#else
+  (void)data;
+#endif
+}
 
 #if PROTON_ROCPROFILER_SDK_HAS_HIP_GRAPH
 void tryBindGraphExecState(RocprofSDKProfiler::RocprofSDKProfilerPimpl *impl,
@@ -891,6 +928,7 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::handleRuntimeEnter(
   auto isMissingName = scope.name.empty();
   profiler.correlation.correlate(record.correlation_id.internal, scope.scopeId,
                                  /*numNodes=*/1, isMissingName, dataToEntry);
+  impl->pendingDispatches.insert(record.correlation_id.internal, true);
   impl->kernelPhaseTracker.record(dataToEntry);
   impl->corrIdToStreamId[record.correlation_id.internal] =
       extractStreamId(operation, payload);
@@ -1073,6 +1111,7 @@ int RocprofSDKProfiler::RocprofSDKProfilerPimpl::graphNodeCorrelationCallback(
         impl->kernelPhaseTracker.record(
             state.nodeIdToState ? state.dataToGraphEntry : state.dataToEntry);
       });
+  impl->pendingDispatches.insert(internalCorrelationId, true);
   profiler.correlation.submit(internalCorrelationId);
   return 0;
 }
@@ -1179,6 +1218,16 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::kernelBufferCallback(
   uint64_t maxCorrelationId = 0;
   DataPhases dataPhases;
 
+  auto processRegularRecord =
+      [&](const rocprofiler_buffer_tracing_kernel_dispatch_record_t *record,
+          const std::string &kernelName, uint64_t streamId) {
+        processKernelRecord(
+            profiler, correlation.corrIdToExternId, correlation.externIdToState,
+            impl->kernelPhaseTracker, dataPhases, kernelName, record, streamId);
+        impl->corrIdToStreamId.erase(record->correlation_id.internal);
+        impl->pendingDispatches.erase(record->correlation_id.internal);
+      };
+
   for (size_t i = 0; i < numHeaders; ++i) {
     auto *header = headers[i];
     if (header->category != ROCPROFILER_BUFFER_CATEGORY_TRACING) {
@@ -1196,6 +1245,42 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::kernelBufferCallback(
       impl->corrIdToStreamId.withRead(
           record->correlation_id.internal,
           [&](const uint64_t &sid) { streamId = sid; });
+
+      if (impl->deferredDispatch) {
+        auto deferred = std::move(*impl->deferredDispatch);
+        impl->deferredDispatch.reset();
+        if (getBoolEnv("PROTON_TEST_DEFER_FIRST_ROCPROFILER_DISPATCH", false)) {
+          // The regression runs two sessions concurrently, destroys one, then
+          // delivers this record. More than one target means the destroyed
+          // session still has a dangling correlation entry.
+          auto externId = Scope::DummyScopeId;
+          size_t targetCount = 0;
+          if (correlation.corrIdToExternId.withRead(
+                  deferred.record.correlation_id.internal,
+                  [&](const size_t &value) { externId = value; }) &&
+              externId != Scope::DummyScopeId) {
+            correlation.externIdToState.withRead(
+                externId, [&](const RocprofSDKProfiler::ExternIdState &state) {
+                  targetCount =
+                      state.dataToEntry.size() + state.dataToGraphEntry.size();
+                });
+          }
+          if (targetCount > 1)
+            std::abort();
+        }
+        processRegularRecord(&deferred.record, deferred.kernelName,
+                             deferred.streamId);
+      }
+
+      if (!impl->deferredDispatchInjected &&
+          getBoolEnv("PROTON_TEST_DEFER_FIRST_ROCPROFILER_DISPATCH", false) &&
+          record->correlation_id.external.ptr == nullptr) {
+        impl->deferredDispatch = RocprofSDKProfilerPimpl::DeferredDispatch{
+            *record, kernelName, streamId};
+        impl->deferredDispatchInjected = true;
+        continue;
+      }
+
 #if PROTON_ROCPROFILER_SDK_HAS_HIP_GRAPH
       if (record->correlation_id.external.ptr != nullptr) {
         // For now, it's only graph dispatch records that carry external
@@ -1211,17 +1296,14 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::kernelBufferCallback(
         delete graphCorrelation;
         record->correlation_id.external.ptr = nullptr;
         record->correlation_id.external.value = 0;
+        impl->corrIdToStreamId.erase(record->correlation_id.internal);
+        impl->pendingDispatches.erase(record->correlation_id.internal);
       } else {
-        processKernelRecord(
-            profiler, correlation.corrIdToExternId, correlation.externIdToState,
-            impl->kernelPhaseTracker, dataPhases, kernelName, record, streamId);
+        processRegularRecord(record, kernelName, streamId);
       }
 #else
-      processKernelRecord(profiler, correlation.corrIdToExternId,
-                          correlation.externIdToState, impl->kernelPhaseTracker,
-                          dataPhases, kernelName, record, streamId);
+      processRegularRecord(record, kernelName, streamId);
 #endif
-      impl->corrIdToStreamId.erase(record->correlation_id.internal);
     }
   }
   profiler.flushDataPhases(dataPhases, profiler.pendingGraphPool.get());
@@ -1414,9 +1496,17 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStart() {
 void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doFlush() {
   auto &state = getRuntimeState();
   std::ignore = hip::deviceSynchronize<true>();
-  profiler.correlation.flush(
-      /*maxRetries=*/100, /*sleepUs=*/10,
-      [&state]() { rocprofiler::flushBuffer<true>(state.kernelBuffer); });
+  const uint64_t maxRetries =
+      getBoolEnv("PROTON_TEST_DEFER_FIRST_ROCPROFILER_DISPATCH", false) ? 1
+                                                                        : 100;
+  constexpr uint64_t sleepUs = 10;
+  rocprofiler::flushBuffer<true>(state.kernelBuffer);
+  auto retries = maxRetries;
+  while (pendingDispatches.size() > 0 && retries > 0) {
+    std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+    rocprofiler::flushBuffer<true>(state.kernelBuffer);
+    --retries;
+  }
   profiler.pendingGraphPool->flushAll();
 }
 
@@ -1425,6 +1515,11 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doStop() {
   state.nvtxEnabled.store(false, std::memory_order_relaxed);
   registerRoctxCallback(false);
   corrIdToStreamId.clear();
+  if (!getBoolEnv("PROTON_TEST_DEFER_FIRST_ROCPROFILER_DISPATCH", false)) {
+    pendingDispatches.clear();
+    deferredDispatch.reset();
+    deferredDispatchInjected = false;
+  }
   kernelPhaseTracker.clear();
   profiler.periodicFlushingEnabled = false;
   profiler.periodicFlushingFormat.clear();
@@ -1454,6 +1549,11 @@ RocprofSDKProfiler::RocprofSDKProfiler() {
 }
 
 RocprofSDKProfiler::~RocprofSDKProfiler() = default;
+
+void RocprofSDKProfiler::doReleaseData(Data *data) {
+  GPUProfiler<RocprofSDKProfiler>::doReleaseData(data);
+  static_cast<RocprofSDKProfilerPimpl *>(pImpl.get())->releaseData(data);
+}
 
 namespace {
 // Runs during dlopen of libproton.so (i.e. `import triton.profiler._C`).
